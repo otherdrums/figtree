@@ -165,6 +165,7 @@ banner("Step 6 — Generate: Injection, Hybrid, and Replay Comparison")
 
 from pdga.kernel.reference import generate as gen_replay, generate_hybrid as gen_hybrid
 from pdga.kernel.inject import generate_from_injection as gen_inject
+from pdga.kernel.residual_inject import generate_from_residuals as gen_residual
 
 did_a, did_b = delta_ids["article_a.txt"], delta_ids["article_b.txt"]
 delta_a = load_delta(Path(db.get(did_a)["path"]))
@@ -176,13 +177,18 @@ console.print(f"\n[bold]Query:[/bold] [yellow]{query}[/yellow]")
 console.print("[bold]Prompt to model:[/bold] just the query above — no article text prepended.")
 
 for label, gen_fn, gen_mode in [
-    ("INJECTION (residual stream perturbation)", gen_inject, "inject"),
-    ("HYBRID (fact token chunks)", gen_hybrid, "hybrid"),
+    ("RESIDUALS (CUDA direct injection at crystal layer)", gen_residual, "residuals"),
+    ("HYBRID (GLiNER fact token chunks)", gen_hybrid, "hybrid"),
     ("REPLAY (full text reference)", gen_replay, "replay"),
+    ("INJECT  (token embedding hook)", gen_inject, "inject"),
 ]:
     console.print(f"\n[bold underline]── {gen_mode.upper()} MODE ──[/bold underline]")
 
-    if gen_mode == "inject":
+    if gen_mode == "residuals":
+        if delta_a.boundaries is not None:
+            console.print(f"[dim]Source: {delta_a.boundaries.shape[0] + delta_b.boundaries.shape[0]} boundary residuals injected at L{delta_a.manifest.crystal_layer}[/dim]")
+        console.print("[dim]Forward hook + CUDA/Triton kernel adds deltas to residual stream[/dim]")
+    elif gen_mode == "inject":
         tok_a = delta_a.injection_token_ids.shape[0] if delta_a.injection_token_ids is not None else 0
         tok_b = delta_b.injection_token_ids.shape[0] if delta_b.injection_token_ids is not None else 0
         console.print(f"[dim]Source: {tok_a + tok_b} windows → GLiNER entity tokens injected at L{delta_a.manifest.injection_layer}[/dim]")
@@ -237,11 +243,11 @@ console.print("[bold green]✓[/bold green] Text → Boundary Residuals → GLiN
 console.print()
 console.print("[bold]PDGA representation:[/bold]")
 console.print("  • 1 boundary residual per window at crystal layer — for LSH retrieval")
-console.print("  • GLiNER entity tokens stored as injection entries (LARQL-style)")
-console.print("  • Injection layer = num_layers - 4 for token-based injection")
-console.print("  • Hybrid mode: fact token chunks prepended to prompt (best compressed mode)")
+console.print("  • Boundary residuals injected directly at crystal layer via CUDA/Triton kernel")
+console.print("  • Residuals mode: forward hook + per-position injection (no token replay)")
+console.print("  • Hybrid mode: GLiNER fact token chunks prepended to prompt (best compressed)")
+console.print("  • Inject mode: token embedding perturbation at injection layer (experimental)")
 console.print("  • Replay mode: full token replay (reference gold standard)")
-console.print("  • Injection mode: token embedding perturbation at injection layer (experimental)")
 console.print("  • Each delta generates independently (sovereign), trust is metadata only")
 console.print()
 console.print("[bold]Model size note:[/bold] Qwen 1.5B (hidden_size=1536) has limited residual capacity.")

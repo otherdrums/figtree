@@ -14,6 +14,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from pdga.delta.context import ContextDelta
 from pdga.kernel.reference import generate as generate_single
 from pdga.kernel.inject import generate_from_injection as generate_inject
+from pdga.kernel.residual_inject import generate_from_residuals as generate_residual
 from pdga.kernel.stream import StreamConfig
 
 
@@ -66,7 +67,12 @@ def think(
             if did in deltas_map:
                 stream_deltas.append(deltas_map[did])
 
-        gen_fn = generate_inject if mode == "inject" else generate_single
+        if mode == "residuals":
+            gen_fn = generate_residual
+        elif mode == "inject":
+            gen_fn = generate_inject
+        else:
+            gen_fn = generate_single
 
         delta_results = []
         for delta in stream_deltas:

@@ -205,7 +205,7 @@ def generate(
     top_k: int = typer.Option(50, help="Top-K sampling"),
     top_p: float = typer.Option(0.95, help="Top-P sampling"),
     show_deltas: bool = typer.Option(False, help="Show loaded delta info"),
-    mode: str = typer.Option("replay", help="Generation mode: replay | hybrid | inject"),
+    mode: str = typer.Option("replay", help="Generation mode: replay | hybrid | residuals | inject"),
 ):
     """Generate text with context from stored deltas."""
     model, tokenizer = _load_model(model_id)
@@ -235,7 +235,9 @@ def generate(
         console.print("[dim]No deltas specified. Generating without context.[/dim]")
         return
 
-    if mode == "inject":
+    if mode == "residuals":
+        from pdga.kernel.residual_inject import generate_from_residuals as gen
+    elif mode == "inject":
         from pdga.kernel.inject import generate_from_injection as gen
     elif mode == "hybrid":
         from pdga.kernel.reference import generate_hybrid as gen
