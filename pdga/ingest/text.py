@@ -2,14 +2,11 @@
 
 The pipeline:
 1. Auto-detect crystal layer using the first portion of the text
-2. Detect injection layer (num_layers - 4, LARQL Apollo pattern)
+2. Injection layer = num_layers - 4 (LARQL Apollo pattern)
 3. Split text into token windows
-4. For each window, forward through model, capture crystal-layer residual
-   at the last token (1 boundary per window)
-5. Forward each boundary residual through crystal+1..injection_layer
-   to precompute the injection delta
-6. GLiNER extracts entities (who/what/where/when/how much) for hybrid mode
-7. Store as ContextDelta: boundary residuals + injection deltas + entity fact chunks
+4. For each window, capture boundary residual at crystal layer (last token)
+5. GLiNER extracts entities; entity token IDs stored as injection entries
+6. Store as ContextDelta: boundaries + injection token IDs + fact chunks
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from pdga.delta.base import DeltaManifest, Delta
 from pdga.delta.context import ContextDelta
-from pdga.ingest.extractor import detect_crystal_layer, detect_injection_layer
+from pdga.ingest.extractor import detect_crystal_layer
 from pdga.ingest.gliner_extractor import (
     GlinerExtractor,
     extract_fact_entities_for_window,
@@ -52,11 +49,11 @@ def ingest_text(
     tags: list[str] | None = None,
     crystal_layer: int | None = None,
 ) -> ContextDelta:
-    """Ingest text into a ContextDelta with GLiNER entity extraction.
+    """Ingest text into a ContextDelta with GLiNER-based injection entries.
 
-    Captures one boundary residual per window (last token at crystal layer)
-    and precomputes injection deltas for residual stream perturbation
-    during generation.
+    Captures one boundary residual per window, extracts GLiNER entities,
+    and stores entity token IDs as injection entries for LARQL-style
+    token injection during generation.
     """
     device = model.device
     output_dir = Path(output_dir)
@@ -68,19 +65,20 @@ def ingest_text(
             calibration_text=text[:2000],
         )
 
-    injection_layer = detect_injection_layer(num_layers)
+    injection_layer = max(1, num_layers - 4)
 
-    token_ids = tokenizer.encode(text)
-    if not token_ids:
+    token_ids_all = tokenizer.encode(text)
+    if not token_ids_all:
         raise ValueError("Text produced zero tokens after encoding")
 
     windows = [
-        token_ids[i : i + window_size]
-        for i in range(0, len(token_ids), window_size)
+        token_ids_all[i : i + window_size]
+        for i in range(0, len(token_ids_all), window_size)
     ]
 
     all_boundaries = []
-    all_injection_deltas = []
+    all_injection_token_ids: list[list[int]] = []
+    all_injection_coeffs: list[list[float]] = []
     fact_chunks_all: list[list[int]] = []
     dynamic_labels: set[str] = set()
     window_token_lists = []
@@ -95,7 +93,6 @@ def ingest_text(
     target_layer = model.model.layers[crystal_layer]
     handle = target_layer.register_forward_hook(capture_hook)
     gliner = _get_gliner()
-    rotary_emb = model.model.rotary_emb
 
     try:
         with torch.inference_mode():
@@ -117,35 +114,23 @@ def ingest_text(
                 boundary = residuals[seq_len - 1].copy()
                 all_boundaries.append(boundary)
 
-                boundary_t = torch.from_numpy(boundary).to(
-                    device=device, dtype=model.dtype
-                ).unsqueeze(0).unsqueeze(0)
-
-                hidden = boundary_t
-                pos_ids = torch.tensor([[0]], dtype=torch.long, device=device)
-                for layer_idx in range(crystal_layer + 1, injection_layer + 1):
-                    layer = model.model.layers[layer_idx]
-                    pe = rotary_emb(hidden, pos_ids)
-                    layer_out = layer(
-                        hidden,
-                        attention_mask=None,
-                        position_ids=pos_ids,
-                        position_embeddings=pe,
-                        use_cache=False,
-                    )
-                    hidden = layer_out if not isinstance(layer_out, tuple) else layer_out[0]
-
-                injection_delta = hidden[0, 0, :].cpu().float().numpy()
-                all_injection_deltas.append(injection_delta)
-
                 window_fact_chunks, entity_positions, w_labels = extract_fact_entities_for_window(
                     window_tokens, residuals, gliner, tokenizer,
                     score_threshold=0.4, span_stability=0.35,
                 )
 
+                window_inj_ids: list[int] = []
+                window_inj_coeffs: list[float] = []
+                for pos in sorted(entity_positions):
+                    if pos < len(window_tokens):
+                        window_inj_ids.append(window_tokens[pos])
+                        window_inj_coeffs.append(1.0)
+
+                all_injection_token_ids.append(window_inj_ids)
+                all_injection_coeffs.append(window_inj_coeffs)
+
                 fact_chunks_all.extend(window_fact_chunks)
                 dynamic_labels.update(w_labels)
-
                 window_token_lists.append(window_tokens)
                 per_token_residuals = None
 
@@ -159,7 +144,13 @@ def ingest_text(
         raise RuntimeError("No boundaries or facts captured — all windows were empty")
 
     boundaries_arr = np.stack(all_boundaries).astype(np.float32)
-    injection_deltas_arr = np.stack(all_injection_deltas).astype(np.float32)
+
+    max_entries = max((len(ids) for ids in all_injection_token_ids), default=0)
+    token_ids_arr = np.zeros((len(all_injection_token_ids), max_entries), dtype=np.int32)
+    coeffs_arr = np.zeros((len(all_injection_coeffs), max_entries), dtype=np.float32)
+    for i, (ids, coeffs) in enumerate(zip(all_injection_token_ids, all_injection_coeffs)):
+        token_ids_arr[i, :len(ids)] = ids
+        coeffs_arr[i, :len(coeffs)] = coeffs
 
     delta_id = Delta.generate_id(text[:10000])
     hidden_size = model.config.hidden_size
@@ -187,7 +178,9 @@ def ingest_text(
         trust=trust,
         source_url=source_url,
         tags=tags or [],
-        injection_deltas=injection_deltas_arr,
+        injection_deltas=boundaries_arr,
+        injection_token_ids=token_ids_arr,
+        injection_coefficients=coeffs_arr,
     )
 
     delta.save(output_dir)

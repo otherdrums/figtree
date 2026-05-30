@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional

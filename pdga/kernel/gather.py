@@ -7,14 +7,13 @@ panels of per-delta results with metadata attribution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
-import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from pdga.delta.context import ContextDelta
 from pdga.kernel.reference import generate as generate_single
+from pdga.kernel.inject import generate_from_injection as generate_inject
 from pdga.kernel.stream import StreamConfig
 
 
@@ -47,6 +46,7 @@ def think(
     max_new_tokens: int = 256,
     top_k: int = 50,
     top_p: float = 0.95,
+    mode: str = "replay",
 ) -> ThinkResult:
     """Run multiple generation streams in parallel.
 
@@ -66,9 +66,11 @@ def think(
             if did in deltas_map:
                 stream_deltas.append(deltas_map[did])
 
+        gen_fn = generate_inject if mode == "inject" else generate_single
+
         delta_results = []
         for delta in stream_deltas:
-            outputs = generate_single(
+            outputs = gen_fn(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PDGA Conflicting News Demo — per-delta independent generation with trust."""
 
-import os, shutil, sqlite3
+import shutil
 from pathlib import Path
 
 import torch
@@ -28,13 +28,13 @@ def banner(title: str):
 # ── Step 0: Clean setup ─────────────────────────────────────────────────────
 banner("PDGA — Parallel Delta Graph Architecture — Demo")
 console.print("[dim]Two conflicting news articles stored as ContextDeltas.[/dim]")
-console.print("[dim]Each delta generates independently at full fidelity.[/dim]")
+console.print("[dim]Each delta generates independently at full fidelity (sovereign).[/dim]")
+console.print("[dim]Generation via residual stream injection (LARQL Apollo-style).[/dim]")
 console.print()
 console.print(f"[bold]Model:[/bold] {MODEL_ID}")
 console.print(f"[bold]GPU:[/bold] {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-console.print(f"[bold]Storage:[/bold] Sparse boundary residuals (novelty-gated, ~8-12% of token positions)")
-console.print(f"[bold]Retrieval:[/bold] Cosine-LSH over boundary residual vectors")
-console.print(f"[bold]Generation:[/bold] Token replay → KV cache (reference); boundary-residual seeding (CUDA path)")
+console.print("[bold]Storage:[/bold] 1 boundary residual per window + precomputed injection deltas")
+console.print("[bold]Generation:[/bold] Residual stream injection at layer L(num_layers-4)")
 
 if PDGA_HOME.exists():
     shutil.rmtree(PDGA_HOME)
@@ -67,7 +67,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 console.print(f"[green]Loaded: {model.config.num_hidden_layers} layers, hidden_size={model.config.hidden_size}[/green]")
 
 # ── Step 3: Ingest ──────────────────────────────────────────────────────────
-banner("Step 3 — Ingest: Text → ContextDelta (crystal layer auto-detected)")
+banner("Step 3 — Ingest: Text → ContextDelta (crystal + injection layers detected)")
 
 from pdga.ingest.text import ingest_text
 from pdga.db.store import DeltaDB
@@ -95,10 +95,13 @@ for fname, trust in [("article_a.txt", TRUST_A), ("article_b.txt", TRUST_B)]:
     )
     lsh.insert(delta.delta_id, delta.boundaries)
     size_kb = sum(f.stat().st_size for f in delta.path.rglob("*") if f.is_file()) / 1024
+    inj_shape = delta.injection_deltas.shape if delta.injection_deltas is not None else (0, 0)
     console.print(f" [green]δID={delta.delta_id}  "
-                  f"boundaries={delta.boundaries.shape[0]}  "
+                  f"windows={delta.num_windows}  "
                   f"crystal=L{delta.manifest.crystal_layer}  "
-                  f"size={size_kb:.1f}KB[/green]")
+                  f"inject=L{delta.manifest.injection_layer}  "
+                  f"size={size_kb:.1f}KB  "
+                  f"deltas={inj_shape}[/green]")
 
 # ── Step 4: Graph ───────────────────────────────────────────────────────────
 banner("Step 4 — Graph: Link Deltas")
@@ -110,8 +113,8 @@ ops.add(delta_ids["article_a.txt"], EdgeType.ABOUT_SAME_EVENT, delta_ids["articl
 console.print(f"  {delta_ids['article_a.txt']} --[contradicts]--> {delta_ids['article_b.txt']}")
 console.print(f"  {delta_ids['article_a.txt']} --[about_same_event]--> {delta_ids['article_b.txt']}")
 
-# ── Step 5: Show delta contents with novel token mapping ──────────────────
-banner("Step 5 — Delta Contents: Novelty-Gated Residuals + Token Mapping")
+# ── Step 5: Show delta structure ────────────────────────────────────────
+banner("Step 5 — Delta Structure: Boundaries + Injection Deltas")
 
 import numpy as np
 from pdga.delta.io import load_delta
@@ -124,15 +127,16 @@ for fname, trust, color in [("article_a.txt", TRUST_A, "green"), ("article_b.txt
     for w in range(delta.num_windows):
         all_ids.extend(delta.get_window_tokens(w))
     total = len(all_ids)
-    novel = delta.boundaries.shape[0]
 
     console.print(f"\n[bold]{fname} (trust={trust:.0%}) — δID={did}[/bold]")
     table = Table()
     table.add_column("Metric", style="dim"); table.add_column("Value")
-    table.add_row("Novel positions", f"[green]{novel}[/green] / {total} ([bold]{novel/max(total,1)*100:.1f}%[/bold])")
-    table.add_row("Boundary vectors", f"( {novel}, , {delta.manifest.hidden_size} ) f32")
+    table.add_row("Windows", str(delta.num_windows))
+    table.add_row("Boundary residuals", f"( {delta.num_windows}, {delta.manifest.hidden_size} ) f32")
+    table.add_row("Injection tokens", f"({delta.num_windows}, {delta.injection_token_ids.shape[1]})" if delta.injection_token_ids is not None else "none")
     table.add_row("Crystal layer", f"L{delta.manifest.crystal_layer}")
-    table.add_row("PDA-size", f"{sum(f.stat().st_size for f in delta.path.rglob('*') if f.is_file())/1024:.1f}KB")
+    table.add_row("Injection layer", f"L{delta.manifest.injection_layer}")
+    table.add_row("PDGA size", f"{sum(f.stat().st_size for f in delta.path.rglob('*') if f.is_file())/1024:.1f}KB")
     table.add_row("Fact chunks", str(len(delta.fact_tokens)) if hasattr(delta, 'fact_tokens') and delta.fact_tokens else "0")
     console.print(table)
 
@@ -140,22 +144,27 @@ for fname, trust, color in [("article_a.txt", TRUST_A, "green"), ("article_b.txt
     if len(delta.dynamic_labels) > 15:
         console.print(f"  [dim]               [/dim] {', '.join(delta.dynamic_labels[15:])}")
 
-    # Show what the novel positions correspond to in the text
-    console.print("\n  [dim]Top 8 novel positions mapped to text:[/dim]")
-    for rank, pos in enumerate(delta.boundary_positions[:8]):
-        if pos < len(all_ids):
-            ctx_ids = all_ids[max(0,pos-2):pos+5]
-            ctx = tokenizer.decode(ctx_ids)
-            console.print(f"    pos={pos:3d}  [{ctx}]")
+    console.print("\n  [dim]Window injection tokens (boundary residual → top-k embedding matches):[/dim]")
+    for w in range(min(delta.num_windows, 8)):
+        ctx_ids = delta.get_window_tokens(w)[:30]
+        ctx = tokenizer.decode(ctx_ids)
+        if delta.injection_token_ids is not None and delta.injection_coefficients is not None:
+            tok_ids = delta.injection_token_ids[w]
+            coeffs = delta.injection_coefficients[w]
+            tokens_str = ", ".join(
+                f"'{tokenizer.decode([int(t)])}'({float(c):.2f})"
+                for t, c in zip(tok_ids, coeffs)
+            )
+            console.print(f"    W{w}: tokens=[{tokens_str}]  ctx=[{ctx}...]")
+        else:
+            d_norm = float(np.linalg.norm(delta.injection_deltas[w])) if delta.injection_deltas is not None else 0.0
+            console.print(f"    W{w}: ||residual||={d_norm:.2f}  [{ctx}...]")
 
 # ── Step 6: Generate — three mode comparison ──────────────────────────────
-banner("Step 6 — Generate: Residual, Replay, and Hybrid Comparison")
+banner("Step 6 — Generate: Injection, Hybrid, and Replay Comparison")
 
-from pdga.kernel.reference import (
-    generate as gen_replay,
-    generate_from_residuals as gen_residual,
-    generate_hybrid as gen_hybrid,
-)
+from pdga.kernel.reference import generate as gen_replay, generate_hybrid as gen_hybrid
+from pdga.kernel.inject import generate_from_injection as gen_inject
 
 did_a, did_b = delta_ids["article_a.txt"], delta_ids["article_b.txt"]
 delta_a = load_delta(Path(db.get(did_a)["path"]))
@@ -164,23 +173,24 @@ delta_b = load_delta(Path(db.get(did_b)["path"]))
 query = "What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
 
 console.print(f"\n[bold]Query:[/bold] [yellow]{query}[/yellow]")
-console.print(f"[bold]Prompt to model:[/bold] just the query above — no article text prepended.")
+console.print("[bold]Prompt to model:[/bold] just the query above — no article text prepended.")
 
 for label, gen_fn, gen_mode in [
-    ("RESIDUAL (boundary-only)", gen_residual, "residual"),
-    ("HYBRID (fact tokens + residuals)", gen_hybrid, "hybrid"),
-    ("REPLAY (full text, reference)", gen_replay, "replay"),
+    ("INJECTION (residual stream perturbation)", gen_inject, "inject"),
+    ("HYBRID (fact token chunks)", gen_hybrid, "hybrid"),
+    ("REPLAY (full text reference)", gen_replay, "replay"),
 ]:
     console.print(f"\n[bold underline]── {gen_mode.upper()} MODE ──[/bold underline]")
 
-    if gen_mode == "residual":
-        console.print(f"[dim]Source: {delta_a.boundaries.shape[0] + delta_b.boundaries.shape[0]} boundary residual vectors only[/dim]")
+    if gen_mode == "inject":
+        tok_a = delta_a.injection_token_ids.shape[0] if delta_a.injection_token_ids is not None else 0
+        tok_b = delta_b.injection_token_ids.shape[0] if delta_b.injection_token_ids is not None else 0
+        console.print(f"[dim]Source: {tok_a + tok_b} windows → GLiNER entity tokens injected at L{delta_a.manifest.injection_layer}[/dim]")
+        console.print("[dim]LARQL-style token embedding perturbation via forward pre_hook[/dim]")
     elif gen_mode == "hybrid":
-        console.print(f"[dim]Source: {len(delta_a.fact_tokens) + len(delta_b.fact_tokens)} GLiNER fact chunks "
-                      f"+ {delta_a.boundaries.shape[0] + delta_b.boundaries.shape[0]} boundary residuals[/dim]")
-        console.print(f"[dim]Dynamic labels: {', '.join(delta_a.dynamic_labels[:12])}...[/dim]")
+        console.print(f"[dim]Source: {len(delta_a.fact_tokens) + len(delta_b.fact_tokens)} GLiNER fact chunks[/dim]")
     else:
-        console.print("[dim]Source: full article token IDs (all 372 tokens)[/dim]")
+        console.print("[dim]Source: full article token IDs[/dim]")
 
     results = gen_fn(model=model, tokenizer=tokenizer, prompt=query,
                      deltas=[delta_a, delta_b], max_new_tokens=150, sample_temp=0.7)
@@ -208,7 +218,7 @@ streams = [
 
 result = think_fn(model=model, tokenizer=tokenizer,
                   prompt=query, streams=streams,
-                  deltas_map=deltas_map, max_new_tokens=150)
+                  deltas_map=deltas_map, max_new_tokens=150, mode="inject")
 
 for r in result.streams:
     label = "CONSCIOUS" if r.is_conscious else "subconscious"
@@ -223,18 +233,23 @@ for r in result.streams:
 
 # ── Done ────────────────────────────────────────────────────────────────────
 banner("Pipeline Complete")
-console.print("[bold green]✓[/bold green] Text → Boundary Residuals → .pdga → LSH → Graph → Generate")
+console.print("[bold green]✓[/bold green] Text → Boundary Residuals → GLiNER Entities → .pdga → LSH → Graph → Generate")
 console.print()
 console.print("[bold]PDGA representation:[/bold]")
-console.print("  • Sparse boundary residuals at crystal layer (L18) — novelty-gated")
-console.print("  • Pairwise cosine distance identifies positions the model can't reproduce")
-console.print(f"  • Only ~{delta_a.boundaries.shape[0]/sum(len(t) for t in delta_a.window_tokens)*100:.0f}% of token positions stored as residual vectors")
-console.print("  • Window token IDs stored for LSH routing, NOT for generation")
-console.print("  • Original text stored only in DB metadata ([bold]pdga show[/bold]), never sent to model")
+console.print("  • 1 boundary residual per window at crystal layer — for LSH retrieval")
+console.print("  • GLiNER entity tokens stored as injection entries (LARQL-style)")
+console.print("  • Injection layer = num_layers - 4 for token-based injection")
+console.print("  • Hybrid mode: fact token chunks prepended to prompt (best compressed mode)")
+console.print("  • Replay mode: full token replay (reference gold standard)")
+console.print("  • Injection mode: token embedding perturbation at injection layer (experimental)")
+console.print("  • Each delta generates independently (sovereign), trust is metadata only")
+console.print()
+console.print("[bold]Model size note:[/bold] Qwen 1.5B (hidden_size=1536) has limited residual capacity.")
+console.print("  LARQL's Apollo achieves perfect recall with Gemma 3 4B (hidden_size=2560).")
+console.print("  The 67% larger hidden dimension enables richer boundary residual encoding.")
 console.print()
 console.print("[bold]Credit:[/bold] Boundary residual concept from [bold]chrishayuk/larql[/bold]")
-console.print("  LARQL's Apollo engine demonstrated that a single residual vector at the crystal")
-console.print("  layer encodes sufficient context for fact retrieval (Apollo 11 transcript demo).")
-console.print("  PDGA extends this with GLiNER-based entity extraction, model-driven semantic")
-console.print("  spans, and a parallel delta graph architecture.")
+console.print("  PDGA extends LARQL with GLiNER entity extraction, multi-delta graph")
+console.print("  architecture, and both compressed (hybrid) and experimental (injection)")
+console.print("  generation modes.")
 db.close()

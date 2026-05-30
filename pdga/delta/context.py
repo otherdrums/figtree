@@ -32,6 +32,8 @@ class ContextDelta(Delta):
         tags: Optional[list[str]] = None,
         kv_projections: Optional[dict] = None,
         injection_deltas: Optional[np.ndarray] = None,
+        injection_token_ids: Optional[np.ndarray] = None,
+        injection_coefficients: Optional[np.ndarray] = None,
     ):
         self.manifest = manifest
         self.boundaries = boundaries
@@ -45,6 +47,8 @@ class ContextDelta(Delta):
         self.tags = tags or []
         self.kv_projections = kv_projections
         self.injection_deltas = injection_deltas
+        self.injection_token_ids = injection_token_ids
+        self.injection_coefficients = injection_coefficients
         self.path = None
 
         if manifest.delta_type != "context":
@@ -85,7 +89,13 @@ class ContextDelta(Delta):
         _write_json(path / "manifest.json", self.manifest.to_dict())
         np.save(path / "boundaries.npy", self.boundaries)
 
-        if self.injection_deltas is not None:
+        if self.injection_token_ids is not None and self.injection_coefficients is not None:
+            np.savez(
+                path / "injection_deltas.npz",
+                token_ids=self.injection_token_ids,
+                coefficients=self.injection_coefficients,
+            )
+        elif self.injection_deltas is not None:
             np.save(path / "injection_deltas.npy", self.injection_deltas)
 
         tokens_dict = {str(i): np.array(t, dtype=np.int32) for i, t in enumerate(self.window_tokens)}
@@ -136,9 +146,22 @@ class ContextDelta(Delta):
                 fact_tokens.append(ft_data[key].tolist())
 
         injection_deltas = None
-        inj_path = path / "injection_deltas.npy"
-        if inj_path.exists():
-            injection_deltas = np.load(inj_path, mmap_mode="r")
+        injection_token_ids = None
+        injection_coefficients = None
+
+        inj_npz = path / "injection_deltas.npz"
+        inj_npy = path / "injection_deltas.npy"
+        if inj_npz.exists():
+            inj_data = np.load(inj_npz, allow_pickle=True)
+            if "token_ids" in inj_data and "coefficients" in inj_data:
+                injection_token_ids = inj_data["token_ids"]
+                injection_coefficients = inj_data["coefficients"]
+            elif "token_ids" in inj_data:
+                injection_token_ids = inj_data["token_ids"]
+                if inj_data["token_ids"].ndim == 1:
+                    injection_token_ids = injection_token_ids.reshape(1, -1)
+        elif inj_npy.exists():
+            injection_deltas = np.load(inj_npy, mmap_mode="r")
 
         delta = cls(
             manifest=manifest,
@@ -153,6 +176,8 @@ class ContextDelta(Delta):
             tags=metadata.get("tags", []),
             kv_projections=kv,
             injection_deltas=injection_deltas,
+            injection_token_ids=injection_token_ids,
+            injection_coefficients=injection_coefficients,
         )
         delta.path = path
         return delta

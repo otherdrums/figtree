@@ -1,7 +1,6 @@
 """PDGA format I/O utilities."""
 
 from pathlib import Path
-from typing import Optional
 
 from pdga.delta.base import Delta
 from pdga.delta.context import ContextDelta

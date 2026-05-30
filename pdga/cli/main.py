@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -207,7 +205,7 @@ def generate(
     top_k: int = typer.Option(50, help="Top-K sampling"),
     top_p: float = typer.Option(0.95, help="Top-P sampling"),
     show_deltas: bool = typer.Option(False, help="Show loaded delta info"),
-    mode: str = typer.Option("replay", help="Generation mode: replay | residual | hybrid"),
+    mode: str = typer.Option("replay", help="Generation mode: replay | hybrid | inject"),
 ):
     """Generate text with context from stored deltas."""
     model, tokenizer = _load_model(model_id)
@@ -237,8 +235,8 @@ def generate(
         console.print("[dim]No deltas specified. Generating without context.[/dim]")
         return
 
-    if mode == "residual":
-        from pdga.kernel.reference import generate_from_residuals as gen
+    if mode == "inject":
+        from pdga.kernel.inject import generate_from_injection as gen
     elif mode == "hybrid":
         from pdga.kernel.reference import generate_hybrid as gen
     else:
@@ -519,6 +517,7 @@ def show(
     table.add_row("Type", entry["delta_type"])
     table.add_row("Model", entry["base_model"])
     table.add_row("Crystal layer", str(delta.manifest.crystal_layer))
+    table.add_row("Injection layer", str(delta.manifest.injection_layer))
     table.add_row("Windows", str(entry["num_windows"]))
     table.add_row("Trust", f"{entry['trust']:.2f}")
     table.add_row("Tags", ", ".join(json.loads(entry.get("tags", "[]"))))
