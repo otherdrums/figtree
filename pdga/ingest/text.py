@@ -1,0 +1,200 @@
+"""Text ingestion pipeline — convert arbitrary text into ContextDelta.
+
+The pipeline:
+1. Auto-detect crystal layer using the first portion of the text
+2. Detect injection layer (num_layers - 4, LARQL Apollo pattern)
+3. Split text into token windows
+4. For each window, forward through model, capture crystal-layer residual
+   at the last token (1 boundary per window)
+5. Forward each boundary residual through crystal+1..injection_layer
+   to precompute the injection delta
+6. GLiNER extracts entities (who/what/where/when/how much) for hybrid mode
+7. Store as ContextDelta: boundary residuals + injection deltas + entity fact chunks
+"""
+
+from __future__ import annotations
+
+import gc
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+from transformers import PreTrainedModel, PreTrainedTokenizer
+
+from pdga.delta.base import DeltaManifest, Delta
+from pdga.delta.context import ContextDelta
+from pdga.ingest.extractor import detect_crystal_layer, detect_injection_layer
+from pdga.ingest.gliner_extractor import (
+    GlinerExtractor,
+    extract_fact_entities_for_window,
+)
+
+_gliner: Optional[GlinerExtractor] = None
+
+
+def _get_gliner() -> GlinerExtractor:
+    global _gliner
+    if _gliner is None:
+        _gliner = GlinerExtractor()
+    return _gliner
+
+
+def ingest_text(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    text: str,
+    output_dir: Path,
+    window_size: int = 200,
+    novel_fraction: float = 0.05,
+    trust: float = 0.5,
+    source_url: str = "",
+    tags: list[str] | None = None,
+    crystal_layer: int | None = None,
+) -> ContextDelta:
+    """Ingest text into a ContextDelta with GLiNER entity extraction.
+
+    Captures one boundary residual per window (last token at crystal layer)
+    and precomputes injection deltas for residual stream perturbation
+    during generation.
+    """
+    device = model.device
+    output_dir = Path(output_dir)
+    num_layers = model.config.num_hidden_layers
+
+    if crystal_layer is None:
+        crystal_layer = detect_crystal_layer(
+            model, tokenizer,
+            calibration_text=text[:2000],
+        )
+
+    injection_layer = detect_injection_layer(num_layers)
+
+    token_ids = tokenizer.encode(text)
+    if not token_ids:
+        raise ValueError("Text produced zero tokens after encoding")
+
+    windows = [
+        token_ids[i : i + window_size]
+        for i in range(0, len(token_ids), window_size)
+    ]
+
+    all_boundaries = []
+    all_injection_deltas = []
+    fact_chunks_all: list[list[int]] = []
+    dynamic_labels: set[str] = set()
+    window_token_lists = []
+
+    per_token_residuals = None
+
+    def capture_hook(module, input, output):
+        nonlocal per_token_residuals
+        out = output[0] if isinstance(output, tuple) else output
+        per_token_residuals = out.detach().float().cpu().numpy()
+
+    target_layer = model.model.layers[crystal_layer]
+    handle = target_layer.register_forward_hook(capture_hook)
+    gliner = _get_gliner()
+    rotary_emb = model.model.rotary_emb
+
+    try:
+        with torch.inference_mode():
+            for i, window_tokens in enumerate(windows):
+                if not window_tokens:
+                    continue
+
+                input_ids = torch.tensor([window_tokens], dtype=torch.long, device=device)
+                attn_mask = torch.ones_like(input_ids)
+
+                _ = model(input_ids=input_ids, attention_mask=attn_mask)
+
+                if per_token_residuals is None:
+                    raise RuntimeError(f"Layer {crystal_layer} hook did not fire")
+
+                residuals = per_token_residuals[0]
+                seq_len = residuals.shape[0]
+
+                boundary = residuals[seq_len - 1].copy()
+                all_boundaries.append(boundary)
+
+                boundary_t = torch.from_numpy(boundary).to(
+                    device=device, dtype=model.dtype
+                ).unsqueeze(0).unsqueeze(0)
+
+                hidden = boundary_t
+                pos_ids = torch.tensor([[0]], dtype=torch.long, device=device)
+                for layer_idx in range(crystal_layer + 1, injection_layer + 1):
+                    layer = model.model.layers[layer_idx]
+                    pe = rotary_emb(hidden, pos_ids)
+                    layer_out = layer(
+                        hidden,
+                        attention_mask=None,
+                        position_ids=pos_ids,
+                        position_embeddings=pe,
+                        use_cache=False,
+                    )
+                    hidden = layer_out if not isinstance(layer_out, tuple) else layer_out[0]
+
+                injection_delta = hidden[0, 0, :].cpu().float().numpy()
+                all_injection_deltas.append(injection_delta)
+
+                window_fact_chunks, entity_positions, w_labels = extract_fact_entities_for_window(
+                    window_tokens, residuals, gliner, tokenizer,
+                    score_threshold=0.4, span_stability=0.35,
+                )
+
+                fact_chunks_all.extend(window_fact_chunks)
+                dynamic_labels.update(w_labels)
+
+                window_token_lists.append(window_tokens)
+                per_token_residuals = None
+
+                if i % 10 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    finally:
+        handle.remove()
+
+    if not all_boundaries and not fact_chunks_all:
+        raise RuntimeError("No boundaries or facts captured — all windows were empty")
+
+    boundaries_arr = np.stack(all_boundaries).astype(np.float32)
+    injection_deltas_arr = np.stack(all_injection_deltas).astype(np.float32)
+
+    delta_id = Delta.generate_id(text[:10000])
+    hidden_size = model.config.hidden_size
+
+    manifest = DeltaManifest(
+        version="0.1.0",
+        delta_id=delta_id,
+        delta_type="context",
+        base_model_id=model.config._name_or_path or "unknown",
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        crystal_layer=crystal_layer,
+        injection_layer=injection_layer,
+        window_size=window_size,
+        num_windows=len(window_token_lists),
+    )
+
+    delta = ContextDelta(
+        manifest=manifest,
+        boundaries=boundaries_arr,
+        window_tokens=window_token_lists,
+        fact_tokens=fact_chunks_all if fact_chunks_all else None,
+        dynamic_labels=sorted(dynamic_labels) if dynamic_labels else None,
+        source_text=text,
+        trust=trust,
+        source_url=source_url,
+        tags=tags or [],
+        injection_deltas=injection_deltas_arr,
+    )
+
+    delta.save(output_dir)
+    delta.path = output_dir / f"{delta_id}.pdga"
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return delta
