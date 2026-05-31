@@ -5,6 +5,7 @@ from pdga.kernel.inject import generate_from_injection
 from pdga.kernel.residual_inject import generate_from_residuals
 from pdga.kernel.gather import think, ThinkResult, StreamResult
 from pdga.kernel.stream import StreamConfig, StreamState
+from pdga.kernel.prompt import build_prompt_ids
 
 __all__ = [
     "generate",
@@ -16,4 +17,5 @@ __all__ = [
     "StreamResult",
     "StreamConfig",
     "StreamState",
+    "build_prompt_ids",
 ]

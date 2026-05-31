@@ -13,6 +13,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 
 from pdga.delta.context import ContextDelta
+from pdga.kernel.prompt import build_prompt_ids
 
 
 def generate(
@@ -39,7 +40,7 @@ def generate(
         for window_idx in range(delta.num_windows):
             context_ids.extend(delta.get_window_tokens(window_idx))
 
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        prompt_ids = build_prompt_ids(tokenizer, prompt, enable_thinking=False)
         full_ids = context_ids + prompt_ids
         full_tensor = torch.tensor([full_ids], dtype=torch.long, device=device)
 

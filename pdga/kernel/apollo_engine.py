@@ -5,11 +5,13 @@ Corrected algorithm (v2):
 2. Forward ALL tokens through ALL layers 0..N-1 with **causal** attention.
 3. At crystal layer, BEFORE forward: replace position-0 residual with boundary.
 4. At crystal layer, AFTER forward: add injection delta to last position.
-5. Re-run full forward at each decode step (no KV cache mismatch).
+5. Full forward re-run at each decode step (no KV cache — the boundary
+   residual IS the context carrier; per-token caching violates the architecture).
 
-This ensures ALL positions are at the same representational level when they
-meet at the crystal layer (layer-k output), unlike v1 which mixed raw
-embeddings with crystal-layer residuals, causing attention collapse.
+The full forward re-run at each step has O(N × seq_len²) complexity.  On a
+Quadro T1000 with Qwen3-4B (bnb-4bit, 36 layers, h=2560) this is ~450 ms/step
+for short sequences.  The C++/CUDA Apollo engine (pdga/apollo/) provides a
+path to production-speed inference while preserving the no-cache design.
 """
 
 from __future__ import annotations
@@ -30,12 +32,14 @@ def apollo_forward(
     Args:
         model: HuggingFace CausalLM (Qwen3 family).
         boundary_residual: (hidden_size,) crystal-layer output encoding the
-            entire past context.  Used to replace position 0 at `crystal_layer`.
+            entire past context.  Replaces position 0 at `crystal_layer`.
         token_embeddings: (1, P, hidden_size) prompt token embeddings.
         crystal_layer: 0-indexed layer where residuals stabilise (e.g. 23
             for Qwen3-4B).
         injection_delta: (hidden_size,) Σ(coeff · embed(token_id)) added to
             the LAST position at `crystal_layer`.  May be ``None``.
+            Recommended coefficient: 0.5–0.75 for full forward re-run
+            (higher values cause output degeneration).
 
     Returns:
         Hidden states (1, 1+P, hidden_size) after all layers + final norm.
@@ -60,7 +64,7 @@ def apollo_forward(
 
         # --- Boundary swap: replace position-0 with real context ---
         if layer_idx == crystal_layer:
-            h[:, 0:1, :] = boundary_residual.unsqueeze(0).unsqueeze(0)
+            h[:, 0:1, :] = boundary_residual.unsqueeze(0)
 
         # Compute RoPE cos/sin fresh (h may have changed via boundary swap).
         position_embeddings = rotary_emb(h, position_ids)
