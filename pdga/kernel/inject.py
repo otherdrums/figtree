@@ -1,6 +1,6 @@
 """Residual stream injection generation — token-driven LARQL-style injection.
 
-Each delta stores token_ids and coefficients derived from GLiNER entity
+Each delta stores token_ids and coefficients for entity
 positions within windows. During generation, a forward pre_hook at the
 injection layer (num_layers - 4) adds the combined token embedding injection
 to hidden states during prefill.
@@ -32,8 +32,8 @@ def generate_from_injection(
 ) -> list[dict]:
     """Generate from token injection entries via forward pre_hook.
 
-    Each delta is sovereign. Token IDs from GLiNER entities (or boundary-
-    based extraction) are injected at the injection layer during prefill.
+    Each delta is sovereign. Token IDs from entity extraction are injected
+    at the injection layer during prefill.
     Standard model.generate() handles autoregressive continuation.
     """
     device = model.device

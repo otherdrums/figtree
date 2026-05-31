@@ -1,7 +1,7 @@
-"""generation engine — multi-delta generation with KV caching and injection.
+"""PDGA generation engine — multi-delta generation with KV caching.
 
 Provides:
-  - generate: unified multi-delta generator with injection support
+  - generate: unified multi-delta generator with KV caching
   - compressed_generate: compressed path using boundary residuals
   - uncompressed_generate: standard path with full text context
   - ModelAdapter: model-agnostic forward pass wrapper

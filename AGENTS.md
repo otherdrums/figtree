@@ -82,12 +82,12 @@ GPU: Quadro T1000 (3GB VRAM)
   - Stored alongside `.pdga` directory
 
 - **Ingestion** (`pdga/ingest/text.py`): Text → ContextDelta with crystal detection,
-  injection layer auto-detection, GLiNER entity extraction, boundary capture, **full KV cache capture**
+  boundary capture, **full KV cache capture**
   - Uses `torch.inference_mode()` (equivalent to `torch.no_grad()`) during forward passes
   - Manual forward through all layers with DynamicCache to capture per-window KV cache
   - `del cache` after each window to free GPU memory before next window
 
-- **Delta format**: `.pdga` directory with `boundaries.npy`, `injection_deltas.npz`, `window_tokens.npz`, **plus `kv_cache_w{N}.pt` files**
+- **Delta format**: `.pdga` directory with `boundaries.npy`, `window_tokens.npz`, **plus `kv_cache_w{N}.pt` files**
 
 - **Retrieval**: LSH over boundary residuals for query-delta matching
 
@@ -100,9 +100,6 @@ GPU: Quadro T1000 (3GB VRAM)
   into specific facts during multi-step generation. LARQL's custom Rust attention engine
   likely handles boundary KV differently (no RoPE, direct KV injection, or custom
   attention patterns). A custom CUDA attention kernel is needed for this path.
-
-- **GLiNER injection entries**: Subword fragments at uniform 1.0 coefficient — noise
-  with no discriminative power. Entity routing needs a better extraction method.
 
 ## generation engine Architecture
 
@@ -207,18 +204,16 @@ previous prompt positions.
 python3 examples/run_demo.py all
 ```
 
-**Article A (372 tokens, pro-deal):** 19/20 facts (95% recall)
+**Article A (372 tokens, pro-deal):** 17/20 facts (85% recall)
 - Found: 47 nations, Maria Okonkwo, Sarah Chen, $45, $12 billion, $900 billion,
   3%, 1.8%, 20 to 12, Brussels, digital services, carbon tariffs,
-  pharmaceutical, climate adaptation, global GDP, multilateral cooperation,
-  shared prosperity, turning point, S&P
-- Missing: landmark
+  pharmaceutical, climate adaptation, global GDP, landmark, S&P
+- Missing: multilateral cooperation, shared prosperity, turning point
 
-**Article B (366 tokens, skeptical):** 12/14 facts (86% recall)
+**Article B (366 tokens, skeptical):** 14/14 facts (100% recall)
 - Found: United States, China, walked out, $900 billion, $45, Geneva,
-  Maria Okonkwo, IMF, S&P, 1.7%, Global Trade Summit, pharmaceutical
-- Missing: carbon tariffs, digital taxation (concepts mentioned but not
-  exact string match)
+  Maria Okonkwo, IMF, S&P, 1.7%, Global Trade Summit, pharmaceutical,
+  carbon tariffs, digital taxation
 
 **Sovereignty**: Zero cross-contamination. Article A output contains no
 B-only facts; Article B output contains no A-only facts.

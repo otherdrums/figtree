@@ -3,9 +3,8 @@
 Tests:
 1. Factual recall with 300+ token generation (single delta)
 2. Multi-delta parallel generation with contradictory articles
-3. Injection-driven entity recall
-4. Speed benchmarking at various configurations
-5. Integration with ingestion pipeline (boundaries, GLiNER entries)
+3. Speed benchmarking at various configurations
+4. Integration with ingestion pipeline (boundaries, KV cache)
 """
 
 import time
@@ -310,7 +309,7 @@ def test_speed_benchmark():
 
 
 def test_injection_entries():
-    """Test with manual entity injection entries (simulated GLiNER output)."""
+    """Test with manual entity injection entries."""
     console.print(Rule("[bold blue]TEST 4: Entity Injection[/bold blue]"))
     console.print("[dim]Manual injection entries for key entities — verify they appear[/dim]")
     console.print()

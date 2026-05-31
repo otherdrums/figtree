@@ -2,12 +2,10 @@
 
 The pipeline:
 1. Auto-detect crystal layer using the first portion of the text
-2. Auto-detect injection layer via residual compression analysis
-3. Split text into token windows
-4. For each window, capture boundary residual at crystal layer (last token)
-5. For each window, capture full KV cache for boundary-kv generation
-6. GLiNER extracts entities; entity token IDs stored as injection entries
-7. Store as ContextDelta: boundaries + injection token IDs + KV cache + fact chunks
+2. Split text into token windows
+3. For each window, capture boundary residual at crystal layer (last token)
+4. For each window, capture full KV cache for boundary-kv generation
+5. Store as ContextDelta: boundaries + KV cache + window tokens
 """
 
 from __future__ import annotations
@@ -24,21 +22,7 @@ from transformers.cache_utils import DynamicCache
 from pdga.delta.base import DeltaManifest, Delta
 from pdga.delta.context import ContextDelta
 from pdga.ingest.extractor import detect_crystal_layer
-from pdga.kernel.corrected import detect_injection_layer
-from pdga.ingest.gliner_extractor import (
-    GlinerExtractor,
-    extract_fact_entities_for_window,
-)
 from pdga.delta.cache_io import save_window_cache
-
-_gliner: Optional[GlinerExtractor] = None
-
-
-def _get_gliner() -> GlinerExtractor:
-    global _gliner
-    if _gliner is None:
-        _gliner = GlinerExtractor()
-    return _gliner
 
 
 def ingest_text(
@@ -53,11 +37,10 @@ def ingest_text(
     tags: list[str] | None = None,
     crystal_layer: int | None = None,
 ) -> ContextDelta:
-    """Ingest text into a ContextDelta with GLiNER-based injection entries.
+    """Ingest text into a ContextDelta with boundary residuals and KV cache.
 
-    Captures one boundary residual per window, extracts GLiNER entities,
-    and stores entity token IDs as injection entries for LARQL-style
-    token injection during generation.
+    Captures one boundary residual per window and the full KV cache for
+    each window, enabling instant prefill during generation.
     """
     device = model.device
     output_dir = Path(output_dir)
@@ -78,15 +61,7 @@ def ingest_text(
         for i in range(0, len(token_ids_all), window_size)
     ]
 
-    injection_layer = detect_injection_layer(
-        model, tokenizer, windows, calibration_text=text[:1000],
-    )
-
     all_boundaries = []
-    all_injection_token_ids: list[list[int]] = []
-    all_injection_coeffs: list[list[float]] = []
-    fact_chunks_all: list[list[int]] = []
-    dynamic_labels: set[str] = set()
     window_token_lists = []
 
     # Generate delta_id and create .pdga directory early for KV cache storage
@@ -103,7 +78,6 @@ def ingest_text(
 
     target_layer = model.model.layers[crystal_layer]
     handle = target_layer.register_forward_hook(capture_hook)
-    gliner = _get_gliner()
 
     try:
         with torch.inference_mode():
@@ -141,23 +115,6 @@ def ingest_text(
                 save_window_cache(cache, delta_dir, i, num_layers)
                 del cache  # free GPU memory — cache already saved to disk
 
-                window_fact_chunks, entity_positions, w_labels = extract_fact_entities_for_window(
-                    window_tokens, residuals, gliner, tokenizer,
-                    score_threshold=0.4, span_stability=0.35,
-                )
-
-                window_inj_ids: list[int] = []
-                window_inj_coeffs: list[float] = []
-                for pos in sorted(entity_positions):
-                    if pos < len(window_tokens):
-                        window_inj_ids.append(window_tokens[pos])
-                        window_inj_coeffs.append(1.0)
-
-                all_injection_token_ids.append(window_inj_ids)
-                all_injection_coeffs.append(window_inj_coeffs)
-
-                fact_chunks_all.extend(window_fact_chunks)
-                dynamic_labels.update(w_labels)
                 window_token_lists.append(window_tokens)
                 per_token_residuals = None
                 del window_tokens  # free variable
@@ -169,17 +126,10 @@ def ingest_text(
     finally:
         handle.remove()
 
-    if not all_boundaries and not fact_chunks_all:
-        raise RuntimeError("No boundaries or facts captured — all windows were empty")
+    if not all_boundaries:
+        raise RuntimeError("No boundaries captured — all windows were empty")
 
     boundaries_arr = np.stack(all_boundaries).astype(np.float32)
-
-    max_entries = max((len(ids) for ids in all_injection_token_ids), default=0)
-    token_ids_arr = np.zeros((len(all_injection_token_ids), max_entries), dtype=np.int32)
-    coeffs_arr = np.zeros((len(all_injection_coeffs), max_entries), dtype=np.float32)
-    for i, (ids, coeffs) in enumerate(zip(all_injection_token_ids, all_injection_coeffs)):
-        token_ids_arr[i, :len(ids)] = ids
-        coeffs_arr[i, :len(coeffs)] = coeffs
 
     hidden_size = model.config.hidden_size
 
@@ -191,7 +141,6 @@ def ingest_text(
         hidden_size=hidden_size,
         num_layers=num_layers,
         crystal_layer=crystal_layer,
-        injection_layer=injection_layer,
         window_size=window_size,
         num_windows=len(window_token_lists),
     )
@@ -200,15 +149,10 @@ def ingest_text(
         manifest=manifest,
         boundaries=boundaries_arr,
         window_tokens=window_token_lists,
-        fact_tokens=fact_chunks_all if fact_chunks_all else None,
-        dynamic_labels=sorted(dynamic_labels) if dynamic_labels else None,
         source_text=text,
         trust=trust,
         source_url=source_url,
         tags=tags or [],
-        injection_deltas=boundaries_arr,
-        injection_token_ids=token_ids_arr,
-        injection_coefficients=coeffs_arr,
     )
 
     delta.save(output_dir)

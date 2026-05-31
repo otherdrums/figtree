@@ -9,10 +9,10 @@ from article-length context on constrained GPUs.
 
 Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
 
-- **Boundary residuals** — LARQL's generation engine stores one residual vector per text window at the crystal layer. The generation 11 transcript demo (370K tokens) compresses to ~2.8MB of boundary residuals — 20,000× over full KV cache.
+- **Boundary residuals** — LARQL stores one residual vector per text window at the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to ~2.8MB of boundary residuals — 20,000× over full KV cache.
 - **Crystal layer detection** — The model layer where the residual stream stabilizes, enabling early-layer skipping.
 - **"The model IS the database"** — Model weights reorganized as queryable knowledge with patches as lightweight overlays.
-- **Boundary-KV engine** — generation stores boundary residuals for LSH retrieval, and full KV caches for generation. This is retrieval + generation, not compression.
+- **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for LSH retrieval, KV cache for generation. This is retrieval + generation, not compression.
 
 PDGA extends these concepts with KV cache serialization, progressive GPU loading
 from system RAM, SDPA-based streaming attention, and a delta graph architecture.
@@ -59,8 +59,8 @@ Full article (372 tokens) → KV cache on disk → progressive GPU load → SDPA
 
 | Article | Tokens | Facts Found | Recall |
 |---------|--------|-------------|--------|
-| Article A (pro-deal) | 372 | 19/20 | 95% |
-| Article B (skeptical) | 366 | 12/14 | 86% |
+| Article A (pro-deal) | 372 | 17/20 | 85% |
+| Article B (skeptical) | 366 | 14/14 | 100% |
 
 **Sovereignty**: Zero cross-contamination. Each article's output contains only
 facts from its own context.
@@ -73,9 +73,9 @@ pdga/
 ├── db/            SQLite delta registry and edges
 ├── graph/         Typed graph edge management
 ├── ingest/        Crystal layer detection, text→ContextDelta pipeline, KV cache capture
-├── kernel/        Per-delta generation (corrected engine with injection)
+├── kernel/        Per-delta generation (corrected engine with residual routing)
 ├── retrieval/     LSH-based boundary residual index
-├── generation/        Streaming generator + boundary-kv engine
+├── generation/    Streaming generator + boundary-kv engine
 └── cli/           Typer CLI
 ```
 
@@ -84,8 +84,6 @@ pdga/
 ```
 delta.pdga/
 ├── boundaries.npy          Boundary residuals at crystal layer (for LSH retrieval)
-├── injection_deltas.npz    Injection delta vectors per window
-├── injection_token_ids.npz Entity token IDs for injection routing
 ├── window_tokens.npz       Token IDs per window
 ├── kv_cache_w0.pt          Full KV cache for window 0 (K/V per layer)
 ├── manifest.json           Model config, crystal layer, provenance
@@ -95,7 +93,6 @@ delta.pdga/
 ## Model
 
 Default: `unsloth/Qwen3-4B-bnb-4bit` (36 layers, hidden_size=2560, 4-bit quantized)  
-Entity extraction: `urchade/gliner_small-v2.1` (dynamic labels, zero-shot NER)  
 Tested on: Quadro T1000 (3GB VRAM)
 
 ## How It Works
@@ -107,7 +104,6 @@ For each window:
 - Manual forward through all 36 layers with `DynamicCache`
 - KV cache saved to `kv_cache_w{N}.pt`
 - Boundary residual captured at crystal layer
-- GLiNER extracts entities for injection entries
 
 ### 2. Generation (`pdga/generation/streaming.py`)
 
@@ -173,10 +169,7 @@ python3 tests/test_generation_comprehensive.py bench
    RoPE does not produce factual recall through HF attention. Requires custom
    CUDA kernel or fine-tuned model.
 
-2. **GLiNER injection entries are noise**: Subword fragments at uniform 1.0
-   coefficient — no discriminative power. Needs better entity extraction.
-
-3. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
+2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
    headroom. Works for 300–500 token articles. For longer context or larger
    models, use Qwen3-2B (~1.5GB) or a 6GB+ GPU.
 
@@ -184,5 +177,3 @@ python3 tests/test_generation_comprehensive.py bench
 
 **chrishayuk/larql** — The boundary residual concept, crystal layer detection,
 boundary-kv engine architecture, and "model IS the database" philosophy.
-
-**urchade/GLiNER** — Zero-shot NER for dynamic fact extraction.

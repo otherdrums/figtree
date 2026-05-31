@@ -5,7 +5,6 @@ position. Compute pairwise cosine distance between consecutive positions.
 Positions where the residual shifted significantly represent novel
 information the model didn't already possess.
 
-Fact detection is handled by gliner_extractor.py (GLiNER-based NER).
 This module handles novelty scoring and semantic span computation.
 """
 

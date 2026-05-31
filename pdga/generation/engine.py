@@ -1,12 +1,11 @@
-"""PDGA generation engine — multi-delta generation with KV caching and injection.
+"""PDGA generation engine — multi-delta generation with KV caching.
 
 Architecture:
     Prefill: Each delta's [window_tokens, prompt_ids] → all layers → KV cache
-    Inject:  At injection_layer, add Σ(coeffᵢ × emb(tokenᵢ)) to last position
-    Decode:  Autoregressive generation using cached KVs, injection at new tokens
+    Decode:  Autoregressive generation using cached KVs
 
-Supports mixed paths (compressed boundary-based and uncompressed text-based deltas),
-multi-delta parallel generation, and entity-level injection for fact enhancement.
+Supports mixed paths (compressed boundary-based and uncompressed text-based deltas)
+and multi-delta parallel generation.
 """
 
 from __future__ import annotations
@@ -31,19 +30,18 @@ def generate(
     top_k: int = 50,
     top_p: float = 0.95,
 ) -> list[dict]:
-    """Generate from multiple deltas in parallel with KV caching and injection.
+    """Generate from multiple deltas in parallel with KV caching.
 
     Args:
         deltas: List of dicts, each with:
           - window_tokens: list[int] — token IDs of the article window
-          - injection_entries: Optional[list[tuple[int, float]]] — (token_id, coeff) pairs
           - metadata: dict with 'delta_id', 'trust', 'source_url', 'tags', etc.
           - boundary: Optional[torch.Tensor] — for compressed path (experimental)
           - crystal_layer: Optional[int] — for compressed path
 
     Returns:
         List of dicts with: delta_id, trust, generated_text, source_url, tags,
-        num_tokens, tokens_per_second, elapsed, injection_layer, entries_injected
+        num_tokens, tokens_per_second, elapsed
     """
     device = model.device
     dtype = model.dtype
