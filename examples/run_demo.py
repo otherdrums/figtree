@@ -156,20 +156,18 @@ inj_b = delta_b.manifest.injection_layer
 # Both articles detected the same layer (same model), take the consensus
 inj_layer = inj_a if inj_a == inj_b else max(inj_a, inj_b)
 
-prompt = "What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
+prompt = "Produce a comprehensive report: What happened at the Global Trade Summit in Geneva? Include every specific detail from the source — all agreements, provisions, numbers, names, dates, reactions, and outcomes."
 
 console.print(f"\n[bold]Query:[/bold] [yellow]{prompt}[/yellow]")
 console.print(f"[bold]Injection layer:[/bold] [bold green]L{inj_layer}[/bold green] — auto-detected via residual compression analysis")
-console.print(f"[dim]  Article A detected L{inj_a}, Article B detected L{inj_b}[/dim]")
 
 # ── Corrected injection mode ──────────────────────────────────────────────────
-console.print(f"\n[bold underline green]── CORRECTED INJECTION (L{inj_layer}, coeff=10.0, top-K=8, 120 tokens) ──[/bold underline green]")
-console.print("[dim]Window tokens + prompt as context.  Entry routing by query-window token overlap.[/dim]")
-console.print("[dim]Injection at L{inj_layer}: sum of top-8 entry embeddings × 10.0 added to residual stream.[/dim]")
+console.print(f"\n[bold underline green]── CORRECTED INJECTION (L{inj_layer}, coeff=10.0, top-K=8, 200 tokens) ──[/bold underline green]")
+console.print(f"[dim]Window tokens + prompt + KV cache.  Routed top-8 entry injection at L{inj_layer}.[/dim]")
 
 results_c = generate_multi_corrected(
     model=model, tokenizer=tokenizer, prompt=prompt,
-    deltas=[delta_a, delta_b], max_new_tokens=120,
+    deltas=[delta_a, delta_b], max_new_tokens=200,
     sample_temp=0.7, injection_layer=inj_layer,
     injection_coefficient=10.0, injection_topk=8,
 )
@@ -183,23 +181,26 @@ for r in results_c:
     entries = r.get("entries_injected", 0)
     title = Text(f"{r['delta_id']}  trust={tp}  ", style=tc)
     title.append(f"{tps:.1f}t/s  {tokens}tok  {entries} entries  {elapsed:.0f}s", style="dim")
-    console.print(Panel(r["generated_text"].strip() or "(empty)", title=title, border_style=tc))
+    console.print(Panel(title, border_style=tc))
+    console.print(r["generated_text"].strip())
+    console.print()
 
 # ── Replay mode ───────────────────────────────────────────────────────────────
-console.print("\n[bold underline blue]── REPLAY (full-text gold standard, 120 tokens) ──[/bold underline blue]")
+console.print("\n[bold underline blue]── REPLAY (full-text gold standard, 200 tokens) ──[/bold underline blue]")
 console.print("[dim]Full article tokens prepended.  Confirms model can recall all specifics.[/dim]")
 
 results_r = gen_replay(
     model=model, tokenizer=tokenizer, prompt=prompt,
-    deltas=[delta_a, delta_b], max_new_tokens=120, sample_temp=0.7,
+    deltas=[delta_a, delta_b], max_new_tokens=200, sample_temp=0.7,
 )
 results_r.sort(key=lambda r: r["trust"], reverse=True)
 for r in results_r:
     tp = f"{r['trust']:.0%}"
     tc = "green" if r["trust"] >= 0.8 else "red"
     title = Text(f"{r['delta_id']}  trust={tp}", style=tc)
-    text = r["generated_text"].strip() or "(empty)"
-    console.print(Panel(text, title=title, border_style=tc))
+    console.print(Panel(title, border_style=tc))
+    console.print(r["generated_text"].strip())
+    console.print()
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 banner("Pipeline Complete")
