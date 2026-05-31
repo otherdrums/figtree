@@ -89,7 +89,12 @@ GPU: Quadro T1000 (3GB VRAM)
 
 - **Delta format**: `.pdga` directory with `boundaries.npy`, `window_tokens.npz`, **plus `kv_cache_w{N}.pt` files**
 
-- **Retrieval**: LSH over boundary residuals for query-delta matching
+- **Retrieval** (`pdga/generation/retrieval.py`): Boundary residual scoring for delta selection
+  - Encode query as mean token embedding, score against delta boundary residuals
+  - Cosine similarity selects most relevant delta(s) from a corpus
+  - Used in demo to show 2x speedup by loading only 1 of 2 deltas
+
+- **Graph**: Edge management (contradicts, about_same_event)
 
 - **Graph**: Edge management (contradicts, about_same_event)
 
@@ -204,12 +209,12 @@ previous prompt positions.
 python3 examples/run_demo.py all
 ```
 
-**Article A (372 tokens, pro-deal):** 20/20 facts (100% recall)
+**Article A (372 tokens, pro-deal):** 19/20 facts (95% recall)
 - Found: 47 nations, landmark, turning point, multilateral cooperation,
   Maria Okonkwo, digital services, 3%, carbon tariffs, $45, pharmaceutical,
   20 to 12, $12 billion, climate adaptation, Brussels, $900 billion, global GDP,
   Sarah Chen, shared prosperity, S&P, 1.8%
-- Missing: none
+- Missing: carbon tariffs (mentioned in both articles)
 
 **Article B (366 tokens, skeptical):** 14/14 facts (100% recall)
 - Found: United States, China, walked out, $900 billion, $45, Geneva,

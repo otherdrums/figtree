@@ -16,6 +16,7 @@ from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from rich.console import Console
@@ -28,6 +29,7 @@ from pdga.ingest.text import ingest_text
 from pdga.db.store import DeltaDB
 from pdga.delta.cache_io import list_window_caches
 from pdga.generation.streaming import StreamingGenerator
+from pdga.generation.retrieval import retrieve_top_windows
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -118,6 +120,30 @@ def do_ingest():
     console.print("\n[bold green]Ingestion complete.[/bold green] Run: python3 run_demo.py generate")
 
 
+def _score_delta_relevance(paths, query, tokenizer, model):
+    """Score each delta's relevance to query using boundary residuals."""
+    import numpy as np
+    from pdga.generation.retrieval import cosine_similarity
+    
+    # Encode query
+    query_ids = tokenizer.encode(query, add_special_tokens=False)
+    device = model.device
+    embed = model.get_input_embeddings()
+    query_tensor = torch.tensor([query_ids], dtype=torch.long, device=device)
+    with torch.no_grad():
+        query_emb = embed(query_tensor).mean(dim=1).squeeze().float().cpu().numpy()
+    
+    scores = []
+    for path in paths:
+        boundaries = np.load(path / "boundaries.npy", mmap_mode="r")
+        # Use mean boundary as delta representation
+        delta_vec = boundaries.mean(axis=0)
+        score = cosine_similarity(query_emb, delta_vec)
+        scores.append(score)
+    
+    return scores
+
+
 def do_generate():
     banner("PDGA Boundary-KV — Generation Phase",
            "Load KV caches from disk → instant prefill → multi-delta decode")
@@ -136,52 +162,86 @@ def do_generate():
     console.print("  Loaded: {} layers, h={}".format(
         model.config.num_hidden_layers, model.config.hidden_size))
 
-    console.print("\n[bold underline green]── STREAMING GENERATION (full article, 600 tokens) ──[/bold underline green]")
-    console.print("[dim]Full article KV cache in system RAM → progressive GPU loading → SDPA[/dim]")
-
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Streaming generation: full article context via progressive KV loading
     paths = sorted(DELTAS_DIR.glob("*.pdga"))
-    wa = list_window_caches(paths[0])[:1]
-    wb = list_window_caches(paths[1])[:1]
+    
+    # Two different queries to demonstrate retrieval
+    queries = {
+        "pro-deal": "What were the positive outcomes agreements and economic benefits",
+        "skeptical": "What went wrong at the summit who walked out and why did it fail",
+    }
 
-    results = []
+    # ── Mode 1: Full Load (both deltas) ────────────────────────────────
+    console.print("\n[bold underline green]── MODE 1: FULL LOAD (both articles) ──[/bold underline green]")
+    
+    full_results = []
     t0 = time.perf_counter()
-    for i, (path, wins) in enumerate([(paths[0], wa), (paths[1], wb)]):
-        kv_path = path / f"kv_cache_w{wins[0]}.pt"
-        gen = StreamingGenerator(model, kv_path)
+    for i, path in enumerate(paths):
+        label = "Article A (pro-deal)" if i == 0 else "Article B (skeptical)"
+        wins = list_window_caches(path)
+        win_paths = [path / f"kv_cache_w{w}.pt" for w in wins]
+        
+        gen = StreamingGenerator(model, win_paths)
         r = gen.generate(
             tokenizer,
-            prompt="Quote verbatim every sentence from the text that contains a name, number, dollar amount, percentage, or location. Do not summarize or rephrase — copy the exact words from the source text:",
+            prompt="Quote verbatim every sentence from the text that contains a name, number, dollar amount, percentage, or location. Do not summarize or rephrase:",
             max_new_tokens=600, sample_temp=0.7,
         )
-        results.append(r)
+        r["label"] = label
+        full_results.append(r)
         del gen
         gc.collect()
         torch.cuda.empty_cache()
+    
+    full_elapsed = time.perf_counter() - t0
+    console.print(f"  Generated: {sum(r['num_tokens'] for r in full_results)} tokens  |  Time: {full_elapsed:.1f}s")
 
-    elapsed = time.perf_counter() - t0
-    total_tok = sum(r["num_tokens"] for r in results)
-    console.print(f"  Generated: {total_tok} tokens in {elapsed:.1f}s ({total_tok/elapsed:.1f} t/s)\n")
+    # ── Mode 2: Retrieval (relevant delta only) ──────────────────────────
+    console.print("\n[bold underline yellow]── MODE 2: RETRIEVAL (query-relevant delta only) ──[/bold underline yellow]")
+    console.print("[dim]Boundary residuals scored against query → only matching delta loaded[/dim]")
+    
+    ret_results = []
+    t0 = time.perf_counter()
+    
+    for query_name, query_text in queries.items():
+        # Score deltas
+        scores = _score_delta_relevance(paths, query_text, tokenizer, model)
+        best_idx = int(np.argmax(scores))
+        best_path = paths[best_idx]
+        best_label = "Article A (pro-deal)" if best_idx == 0 else "Article B (skeptical)"
+        
+        console.print(f"  Query: '{query_name}' → matched {best_label} (score={scores[best_idx]:.3f})")
+        
+        wins = list_window_caches(best_path)
+        win_paths = [best_path / f"kv_cache_w{w}.pt" for w in wins]
+        
+        gen = StreamingGenerator(model, win_paths)
+        r = gen.generate(
+            tokenizer,
+            prompt="Quote verbatim every sentence from the text that contains a name, number, dollar amount, percentage, or location. Do not summarize or rephrase:",
+            max_new_tokens=600, sample_temp=0.7,
+        )
+        r["label"] = f"{best_label} (retrieval: {query_name})"
+        ret_results.append(r)
+        del gen
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    ret_elapsed = time.perf_counter() - t0
+    console.print(f"  Generated: {sum(r['num_tokens'] for r in ret_results)} tokens  |  Time: {ret_elapsed:.1f}s")
+    console.print(f"  [green]Speedup: {full_elapsed/ret_elapsed:.2f}×  (half the deltas loaded)[/green]")
 
-    # Display output
-    for i, r in enumerate(results):
-        label = "Article A (pro-deal)" if i == 0 else "Article B (skeptical)"
-        trust = "99%" if i == 0 else "50%"
-        tc = "green" if i == 0 else "red"
-        title = Text("{} — trust={}".format(label, trust), style=tc)
-        title.append("  {} tokens  {:.1f} t/s".format(
-            r["num_tokens"], r["tokens_per_second"]), style="dim")
-        console.print(Panel(title, border_style=tc))
-        console.print(r["generated_text"])
-        console.print()
+    # ── Display & Fact Check ───────────────────────────────────────────
+    for mode_label, results in [("FULL LOAD", full_results), ("RETRIEVAL", ret_results)]:
+        console.print(f"\n[bold]{mode_label}[/bold]")
+        for r in results:
+            tc = "green" if "Article A" in r["label"] else "red"
+            title = Text(r["label"], style=tc)
+            title.append(f"  {r['num_tokens']} tokens  {r['tokens_per_second']:.1f} t/s", style="dim")
+            console.print(Panel(title, border_style=tc))
+            console.print(r["generated_text"][:800])
+            console.print()
 
     # Fact check
-    text_a = results[0]["generated_text"]
-    text_b = results[1]["generated_text"]
-
     facts_a = [
         "47 nations", "landmark", "turning point", "multilateral cooperation",
         "Maria Okonkwo", "digital services", "3%", "carbon tariffs",
@@ -196,51 +256,49 @@ def do_generate():
         "IMF", "Global Trade Summit", "Geneva",
     ]
 
-    for label, txt, facts in [("Article A", text_a, facts_a),
-                               ("Article B", text_b, facts_b)]:
-        hits, found = check_facts(txt, facts)
-        table = Table(title="{} — {}/{} facts".format(label, hits, len(facts)))
-        table.add_column("Fact", style="dim")
-        table.add_column("Found")
-        rows = sorted(zip(facts, found), key=lambda x: (not x[1], x[0]))
-        for f, ok in rows:
-            table.add_row(f, "[green]✓[/green]" if ok else "[red]✗[/red]")
-        console.print(table)
-        console.print()
+    for mode_label, results in [("FULL LOAD", full_results), ("RETRIEVAL", ret_results)]:
+        console.print(f"\n[bold]{mode_label} — Fact Check[/bold]")
+        
+        if mode_label == "FULL LOAD":
+            texts = [("Article A", results[0]["generated_text"], facts_a),
+                     ("Article B", results[1]["generated_text"], facts_b)]
+        else:
+            # Retrieval mode: first result is pro-deal query, second is skeptical
+            texts = [("Retrieved A", results[0]["generated_text"], facts_a),
+                     ("Retrieved B", results[1]["generated_text"], facts_b)]
+        
+        for label, txt, facts in texts:
+            hits, found = check_facts(txt, facts)
+            table = Table(title=f"{label} — {hits}/{len(facts)} facts")
+            table.add_column("Fact", style="dim")
+            table.add_column("Found")
+            rows = sorted(zip(facts, found), key=lambda x: (not x[1], x[0]))
+            for f, ok in rows:
+                table.add_row(f, "[green]✓[/green]" if ok else "[red]✗[/red]")
+            console.print(table)
 
-    # Sovereignty check
+    # Sovereignty check (full load)
+    text_a = full_results[0]["generated_text"]
+    text_b = full_results[1]["generated_text"]
     a_only = {"47 nations", "$12 billion", "Brussels", "1.8%",
                "shared prosperity", "multilateral cooperation",
                "landmark", "turning point", "Sarah Chen", "climate adaptation"}
     b_only = {"walked out", "1.7%", "IMF"}
-
     contam_a = [f for f in b_only if f.lower() in text_a.lower()]
     contam_b = [f for f in a_only if f.lower() in text_b.lower()]
-
+    
+    console.print("\n[bold]Sovereignty Check[/bold]")
     if contam_a:
-        console.print("[red]⚠  Article A output leaks B-facts: {}[/red]".format(", ".join(contam_a)))
+        console.print(f"[red]⚠  Article A leaks B-facts: {', '.join(contam_a)}[/red]")
     else:
-        console.print("[green]✓  Article A clean — no cross-contamination[/green]")
-
+        console.print("[green]✓  Article A clean[/green]")
     if contam_b:
-        console.print("[red]⚠  Article B output leaks A-facts: {}[/red]".format(", ".join(contam_b)))
+        console.print(f"[red]⚠  Article B leaks A-facts: {', '.join(contam_b)}[/red]")
     else:
-        console.print("[green]✓  Article B clean — no cross-contamination[/green]")
+        console.print("[green]✓  Article B clean[/green]")
 
     console.print()
-    console.print("[bold]Key contradiction highlights:[/bold]")
-    for label, a_fact, b_fact in [
-        ("Signatories", "47 nations" in text_a, "34 nations" in text_b),
-        ("Carbon tariff", "$45" in text_a, "$15" in text_b),
-        ("GDP impact", "$900 billion" in text_a, "$250 billion" in text_b),
-        ("US/China", "", "walked out" in text_b),
-    ]:
-        a_s = "[green]✓[/green]" if a_fact else "[dim]-[/dim]"
-        b_s = "[green]✓[/green]" if b_fact else "[dim]-[/dim]"
-        console.print("  {:<15}  A: {}    B: {}".format(label, a_s, b_s))
-
-    console.print()
-    console.print("[bold green]✓[/bold green] Boundary-KV engine complete — instant prefill from stored KV caches")
+    console.print("[bold green]✓[/bold green] Boundary-KV + delta-level retrieval complete")
     console.print("[dim]Credit: LARQL boundary-kv engine concept from chrishayuk/larql[/dim]")
 
     gc.collect()

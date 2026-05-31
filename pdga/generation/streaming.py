@@ -15,37 +15,53 @@ import gc
 import time
 import torch
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from transformers.cache_utils import DynamicCache
 from pdga.kernel.prompt import build_prompt_ids
 
 
 class StreamingGenerator:
-    """Generate using progressively loaded KV cache."""
+    """Generate using progressively loaded KV cache.
 
-    def __init__(self, model, kv_cache_path: Path, window_size: int = 300):
+    Supports single-window or multi-window KV cache loading.
+    For multi-window, windows are loaded in sequence with correct position offsets.
+    """
+
+    def __init__(
+        self,
+        model,
+        kv_cache_paths: Union[Path, list[Path]],
+        window_size: int = 300,
+    ):
         self.model = model
         self.num_layers = model.config.num_hidden_layers
-        self.window_size = None
+        self.window_sizes = []
 
-        # Load full KV cache to CPU RAM
-        state = torch.load(str(kv_cache_path), map_location="cpu", weights_only=True)
-        self._window_k = []
-        self._window_v = []
-        for li in range(self.num_layers):
-            self._window_k.append(state.get(f"layer_{li}_keys"))
-            self._window_v.append(state.get(f"layer_{li}_values"))
-        del state
+        # Normalize to list
+        if isinstance(kv_cache_paths, Path):
+            kv_cache_paths = [kv_cache_paths]
 
-        if self._window_k[0] is not None:
-            self.window_size = self._window_k[0].shape[2]
-            # Validate: all layers must have the same seq length
+        # Load all KV caches to CPU RAM
+        self._windows_k: list[list] = []  # [window_idx][layer_idx] = tensor
+        self._windows_v: list[list] = []
+
+        for w_idx, path in enumerate(kv_cache_paths):
+            state = torch.load(str(path), map_location="cpu", weights_only=True)
+            window_k = []
+            window_v = []
+            w_len = None
             for li in range(self.num_layers):
-                if self._window_k[li].shape[2] != self.window_size:
-                    raise ValueError(
-                        f"Layer {li} KV has {self._window_k[li].shape[2]} positions, "
-                        f"expected {self.window_size}"
-                    )
+                k = state.get(f"layer_{li}_keys")
+                v = state.get(f"layer_{li}_values")
+                window_k.append(k)
+                window_v.append(v)
+                if k is not None and w_len is None:
+                    w_len = k.shape[2]
+            del state
+            self._windows_k.append(window_k)
+            self._windows_v.append(window_v)
+            self.window_sizes.append(w_len if w_len else 0)
+
         gc.collect()
 
     def generate(
@@ -65,7 +81,11 @@ class StreamingGenerator:
         final_norm = self.model.model.norm
         rotary = self.model.model.rotary_emb
         eos = tokenizer.eos_token_id
-        offset = self.window_size
+
+        # Total window context length
+        total_window_len = sum(self.window_sizes)
+        offset = total_window_len
+        num_windows = len(self._windows_k)
 
         prompt_ids = build_prompt_ids(tokenizer, prompt, enable_thinking=False)
         P = len(prompt_ids)
@@ -79,7 +99,7 @@ class StreamingGenerator:
         h = embed(torch.tensor([prompt_ids], dtype=torch.long, device=device))
         pos_ids = torch.arange(offset, offset + P, device=device, dtype=torch.long).unsqueeze(0)
 
-        # Explicit causal mask
+        # Explicit causal mask: prompt sees all window positions + previous prompt positions
         attn_mask = torch.full(
             (1, 1, P, offset + P), -(2**15), device=device, dtype=dtype,
         )
@@ -89,11 +109,12 @@ class StreamingGenerator:
         # ── Prefill with incremental KV loading ──────────────────────────
         with torch.no_grad():
             for li in range(self.num_layers):
-                # Load this layer's window KV from CPU to GPU (one layer at a time)
-                if self._window_k[li] is not None:
-                    k = self._window_k[li].to(device=device, dtype=dtype)
-                    v = self._window_v[li].to(device=device, dtype=dtype)
-                    cache.update(k, v, li)
+                # Load ALL windows' K/V for this layer from CPU to GPU
+                for w_idx in range(num_windows):
+                    if self._windows_k[w_idx][li] is not None:
+                        k = self._windows_k[w_idx][li].to(device=device, dtype=dtype)
+                        v = self._windows_v[w_idx][li].to(device=device, dtype=dtype)
+                        cache.update(k, v, li)
 
                 layer = self.model.model.layers[li]
                 pe = rotary(h, pos_ids)
@@ -149,7 +170,8 @@ class StreamingGenerator:
             "tokens_per_second": ntok / elapsed if elapsed > 0 else 0.0,
             "elapsed": elapsed,
             "path": "streaming",
-            "window_tokens": self.window_size,
+            "window_tokens": total_window_len,
+            "num_windows_loaded": num_windows,
         }
 
 

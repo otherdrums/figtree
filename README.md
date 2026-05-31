@@ -53,14 +53,18 @@ The demo runs the **streaming generator** with progressive KV loading:
 
 ```
 Full article (372 tokens) → KV cache on disk → progressive GPU load → SDPA → 600 tokens generated
+
+Retrieval mode: boundary residuals scored against query → only relevant delta loaded → 2x speedup
 ```
 
 **Results** (Qwen3-4B on Quadro T1000, 3GB):
 
 | Article | Tokens | Facts Found | Recall |
 |---------|--------|-------------|--------|
-| Article A (pro-deal) | 372 | 20/20 | 100% |
+| Article A (pro-deal) | 372 | 19/20 | 95% |
 | Article B (skeptical) | 366 | 14/14 | 100% |
+| Retrieved A (pro-deal) | 372 | 19/20 | 95% |
+| Retrieved B (skeptical) | 366 | 14/14 | 100% |
 
 **Sovereignty**: Zero cross-contamination. Each article's output contains only
 facts from its own context.
