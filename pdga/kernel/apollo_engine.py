@@ -1,30 +1,21 @@
 """Apollo-style forward pass — LARQL-compatible residual stream engine.
 
-Implements the full Apollo injection pattern using PyTorch operations
-(already on CUDA) with an optional fused CUDA kernel for injection speed.
+Corrected algorithm (v2):
+1. Dummy token at position 0, prompt embeddings at positions 1+.
+2. Forward ALL tokens through ALL layers 0..N-1 with **causal** attention.
+3. At crystal layer, BEFORE forward: replace position-0 residual with boundary.
+4. At crystal layer, AFTER forward: add injection delta to last position.
+5. Re-run full forward at each decode step (no KV cache mismatch).
 
-Key mechanics (matching LARQL Apollo):
-1. Boundary residual at position 0 (crystal-layer level, replaces layers 0..crystal-1)
-2. Prompt embeddings at positions 1..P (embedding level)
-3. Forward through layers crystal..N-1 with full bidirectional attention
-4. Injection delta added at last position at crystal layer
-5. Re-run full forward at each decode step (no KV cache mismatch)
+This ensures ALL positions are at the same representational level when they
+meet at the crystal layer (layer-k output), unlike v1 which mixed raw
+embeddings with crystal-layer residuals, causing attention collapse.
 """
 
 from __future__ import annotations
 
-import math
 import torch
-import torch.nn.functional as F
 from transformers import PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
-
-# Try optional CUDA kernel
-try:
-    from pdga.kernel.cuda_inject import inject_at_position
-    _cuda_inject = inject_at_position
-except Exception:
-    _cuda_inject = None
 
 
 def apollo_forward(
@@ -34,100 +25,57 @@ def apollo_forward(
     crystal_layer: int,
     injection_delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apollo-style forward: boundary at pos-0, embeddings at pos-1+, skip 0..crystal-1."""
+    """Apollo forward: boundary swap at crystal layer, full-layer causal forward.
+
+    Args:
+        model: HuggingFace CausalLM (Qwen3 family).
+        boundary_residual: (hidden_size,) crystal-layer output encoding the
+            entire past context.  Used to replace position 0 at `crystal_layer`.
+        token_embeddings: (1, P, hidden_size) prompt token embeddings.
+        crystal_layer: 0-indexed layer where residuals stabilise (e.g. 23
+            for Qwen3-4B).
+        injection_delta: (hidden_size,) Σ(coeff · embed(token_id)) added to
+            the LAST position at `crystal_layer`.  May be ``None``.
+
+    Returns:
+        Hidden states (1, 1+P, hidden_size) after all layers + final norm.
+    """
     num_layers = model.config.num_hidden_layers
+    hidden_size = model.config.hidden_size
     device = token_embeddings.device
     dtype = token_embeddings.dtype
-    config = model.config
-
-    B = boundary_residual.unsqueeze(0).unsqueeze(0)
     P = token_embeddings.shape[1]
-    h = torch.cat([B, token_embeddings], dim=1)
-    L = 1 + P
+    L = 1 + P  # 1 boundary position + P prompt positions
 
-    is_qwen3 = hasattr(config, 'model_type') and config.model_type == 'qwen3'
+    # Position 0: dummy (zero) — minimal perturbation during layers 0..crystal-1,
+    # replaced with real boundary at crystal layer.
+    dummy = torch.zeros(1, 1, hidden_size, device=device, dtype=dtype)
+    h = torch.cat([dummy, token_embeddings], dim=1)  # (1, L, hidden_size)
 
-    for layer_idx in range(crystal_layer, num_layers):
+    rotary_emb = model.model.rotary_emb
+    position_ids = torch.arange(0, L, device=device, dtype=torch.long).unsqueeze(0)
+
+    for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
 
-        residual = h
-        h_norm = layer.input_layernorm(h)
+        # --- Boundary swap: replace position-0 with real context ---
+        if layer_idx == crystal_layer:
+            h[:, 0:1, :] = boundary_residual.unsqueeze(0).unsqueeze(0)
 
-        attn_out = _compute_attention(
-            model, layer.self_attn, h_norm, L, config, device, dtype, is_qwen3,
+        # Compute RoPE cos/sin fresh (h may have changed via boundary swap).
+        position_embeddings = rotary_emb(h, position_ids)
+
+        # causal attention is automatic when attention_mask=None (SDPA is_causal=True)
+        h = layer(
+            h,
+            attention_mask=None,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
         )
-        h = residual + attn_out
 
-        residual = h
-        h_norm = layer.post_attention_layernorm(h)
-
-        gate = layer.mlp.gate_proj(h_norm)
-        up = layer.mlp.up_proj(h_norm)
-        act = _get_activation_fn(model)
-        down = layer.mlp.down_proj(act(gate) * up)
-        h = residual + down
-
+        # --- Token-embedding injection at crystal layer ---
         if layer_idx == crystal_layer and injection_delta is not None:
-            if _cuda_inject is not None:
-                h = _cuda_inject(h, injection_delta, L - 1)
-            else:
-                h[:, -1, :] = h[:, -1, :] + injection_delta.unsqueeze(0)
+            h[:, -1, :] = h[:, -1, :] + injection_delta.unsqueeze(0)
 
     h = model.model.norm(h)
     return h
-
-
-def _compute_attention(model, attn, hidden, seq_len, config, device, dtype, is_qwen3):
-    """Attention with full bidirectional masking, Qwen2/3 compatible."""
-    bsz = hidden.shape[0]
-    q_len = hidden.shape[1]
-    num_heads = config.num_attention_heads
-    num_kv_heads = config.num_key_value_heads
-    head_dim = attn.head_dim
-    num_kv_groups = num_heads // num_kv_heads
-
-    query = attn.q_proj(hidden)
-    key = attn.k_proj(hidden)
-    value = attn.v_proj(hidden)
-
-    query = query.view(bsz, q_len, num_heads, head_dim)
-    key = key.view(bsz, q_len, num_kv_heads, head_dim)
-    value = value.view(bsz, q_len, num_kv_heads, head_dim)
-
-    if is_qwen3 and hasattr(attn, 'q_norm'):
-        query = attn.q_norm(query)
-    if is_qwen3 and hasattr(attn, 'k_norm'):
-        key = attn.k_norm(key)
-
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-
-    pos_ids = torch.arange(0, seq_len, device=device, dtype=torch.long).unsqueeze(0)
-    cos, sin = model.model.rotary_emb(value, pos_ids)
-    query, key = apply_rotary_pos_emb(query, key, cos, sin)
-
-    key = repeat_kv(key, num_kv_groups)
-    value = repeat_kv(value, num_kv_groups)
-
-    attn_weights = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
-    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
-
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, num_heads * head_dim)
-    attn_output = attn.o_proj(attn_output)
-    return attn_output
-
-
-def _get_activation_fn(model):
-    """Get the activation function from the model config."""
-    config = model.config
-    if hasattr(config, 'hidden_act'):
-        act_name = config.hidden_act
-        if act_name == 'silu':
-            return F.silu
-        elif act_name == 'gelu':
-            return F.gelu
-        elif act_name == 'gelu_pytorch_tanh':
-            return lambda x: F.gelu(x, approximate='tanh')
-    return F.silu
