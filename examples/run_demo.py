@@ -143,27 +143,33 @@ for fname, trust, color in [("article_a.txt", TRUST_A, "green"), ("article_b.txt
 # ── Step 6 ────────────────────────────────────────────────────────────────────
 banner("Step 6 — Generate: Corrected Injection vs Replay Gold Standard")
 
-from pdga.kernel.corrected import generate_multi_corrected, _detect_injection_layer
+from pdga.kernel.corrected import generate_multi_corrected
 from pdga.kernel.reference import generate as gen_replay
 
 did_a, did_b = delta_ids["article_a.txt"], delta_ids["article_b.txt"]
 delta_a = load_delta(Path(db.get(did_a)["path"]))
 delta_b = load_delta(Path(db.get(did_b)["path"]))
 
-inj_layer = _detect_injection_layer(model.config.num_hidden_layers)
+# Use the auto-detected injection layer from the manifest
+inj_a = delta_a.manifest.injection_layer
+inj_b = delta_b.manifest.injection_layer
+# Both articles detected the same layer (same model), take the consensus
+inj_layer = inj_a if inj_a == inj_b else max(inj_a, inj_b)
+
 prompt = "What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
 
 console.print(f"\n[bold]Query:[/bold] [yellow]{prompt}[/yellow]")
-console.print(f"[bold]Auto-detected injection layer:[/bold] L{inj_layer} ({model.config.num_hidden_layers} layers - 6)")
+console.print(f"[bold]Injection layer:[/bold] [bold green]L{inj_layer}[/bold green] — auto-detected via residual compression analysis")
+console.print(f"[dim]  Article A detected L{inj_a}, Article B detected L{inj_b}[/dim]")
 
 # ── Corrected injection mode ──────────────────────────────────────────────────
-console.print(f"\n[bold underline green]── CORRECTED INJECTION (L{inj_layer}, coeff=10.0, top-K=8) ──[/bold underline green]")
-console.print("[dim]Window tokens + prompt as context.  Injection at auto-detected layer.[/dim]")
-console.print("[dim]Entry routing: token-overlap between query and window tokens selects top-8 entries.[/dim]")
+console.print(f"\n[bold underline green]── CORRECTED INJECTION (L{inj_layer}, coeff=10.0, top-K=8, 120 tokens) ──[/bold underline green]")
+console.print("[dim]Window tokens + prompt as context.  Entry routing by query-window token overlap.[/dim]")
+console.print("[dim]Injection at L{inj_layer}: sum of top-8 entry embeddings × 10.0 added to residual stream.[/dim]")
 
 results_c = generate_multi_corrected(
     model=model, tokenizer=tokenizer, prompt=prompt,
-    deltas=[delta_a, delta_b], max_new_tokens=60,
+    deltas=[delta_a, delta_b], max_new_tokens=120,
     sample_temp=0.7, injection_layer=inj_layer,
     injection_coefficient=10.0, injection_topk=8,
 )
@@ -176,16 +182,16 @@ for r in results_c:
     tokens = r.get("num_tokens", 0)
     entries = r.get("entries_injected", 0)
     title = Text(f"{r['delta_id']}  trust={tp}  ", style=tc)
-    title.append(f"{tps:.1f}t/s  {tokens}tok  L{inj_layer}  {entries} entries  {elapsed:.0f}s", style="dim")
+    title.append(f"{tps:.1f}t/s  {tokens}tok  {entries} entries  {elapsed:.0f}s", style="dim")
     console.print(Panel(r["generated_text"].strip() or "(empty)", title=title, border_style=tc))
 
 # ── Replay mode ───────────────────────────────────────────────────────────────
-console.print("\n[bold underline blue]── REPLAY (full-text gold standard) ──[/bold underline blue]")
+console.print("\n[bold underline blue]── REPLAY (full-text gold standard, 120 tokens) ──[/bold underline blue]")
 console.print("[dim]Full article tokens prepended.  Confirms model can recall all specifics.[/dim]")
 
 results_r = gen_replay(
     model=model, tokenizer=tokenizer, prompt=prompt,
-    deltas=[delta_a, delta_b], max_new_tokens=60, sample_temp=0.7,
+    deltas=[delta_a, delta_b], max_new_tokens=120, sample_temp=0.7,
 )
 results_r.sort(key=lambda r: r["trust"], reverse=True)
 for r in results_r:
@@ -193,25 +199,21 @@ for r in results_r:
     tc = "green" if r["trust"] >= 0.8 else "red"
     title = Text(f"{r['delta_id']}  trust={tp}", style=tc)
     text = r["generated_text"].strip() or "(empty)"
-    console.print(Panel(text[:500] + ("..." if len(text) > 500 else ""), title=title, border_style=tc))
+    console.print(Panel(text, title=title, border_style=tc))
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 banner("Pipeline Complete")
 console.print("[bold green]✓[/bold green] Text → Boundaries + GLiNER → .pdga → Corrected Injection → Generate")
 console.print()
 console.print("[bold]How it works:[/bold]")
-console.print("  • Ingest: tokenize article → split into 200-token windows → GLiNER entity extraction")
-console.print(f"  • Per window: store boundary residual at L{delta_a.manifest.crystal_layer} + entity token IDs")
-console.print("  • Generate: match query tokens to window tokens → select top-8 entity entries")
-console.print(f"  • Inject at L{inj_layer} (auto-detected as num_layers - 6): sum of entry embeddings × 10.0")
-console.print("  • Context: matched window tokens (200) + prompt tokens ≈ 230 tokens → full forward pass")
+console.print(f"  • Crystal layer L{delta_a.manifest.crystal_layer}: where boundary residuals stabilise")
+console.print(f"  • Injection layer L{inj_layer}: where residual compression peaks —")
+console.print("    model has maximally organised the article's facts but hasn't converged to generic output yet")
+console.print("  • Detect: run 2 article windows + 1 calibration text through all layers,")
+console.print("    find peak of within-article compression ÷ cross-context separation")
+console.print("  • Inject: top-8 entry embeddings (routed by query-window token overlap) × 10.0")
+console.print("  • Context: matched window tokens (200) + prompt tokens ≈ 230 tokens")
 console.print("  • KV cache: window+prompt prefilled once per delta, decode steps use cache")
 console.print()
-console.print("[bold]What changed (vs earlier broken PDGA attempts):[/bold]")
-console.print("  • Injection at context-selective layer, not crystal layer (L23 → L30)")
-console.print("  • Top-8 routed entries (not 260+ summed blindly)")
-console.print("  • Window tokens as context (not dummy+prompt only)")
-console.print("  • inject_coefficient = 10.0 (LARQL default, not 1.5-3.0)")
-console.print()
-console.print("[bold]Credit:[/bold] Boundary residual concept + injection architecture from [bold]chrishayuk/larql[/bold]")
+console.print("[bold]Credit:[/bold] Boundary residual concept from [bold]chrishayuk/larql[/bold]")
 db.close()

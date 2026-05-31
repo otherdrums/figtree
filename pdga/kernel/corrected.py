@@ -240,17 +240,128 @@ def _route_and_retrieve(
 
 
 def _detect_injection_layer(num_layers: int) -> int:
-    """Auto-detect the injection layer.
+    """Auto-detect the injection layer via residual compression analysis.
 
-    LARQL's research shows the optimal injection point is near the end of
-    the retrieval/resolve zone, where MLP features become context-selective
-    rather than indiscriminate "population code."  Empirically:
-    - Gemma 3 4B (34L): L30  (LARQL hardcoded default)
-    - Qwen3 4B  (36L): L30  (validated)
+    Runs two windows from the same article and a calibration text through the
+    model.  At each layer L, measures:
 
-    The rule: num_layers - 6, clamped to [20, num_layers-4].
+        within  = 1 - cos(residual_W1[L], residual_W2[L])   (same article)
+        cross   = 1 - cos(residual_W1[L], residual_calib[L]) (different content)
+
+    The within-distance curve rises as the model compresses the article's
+    information into the residual stream.  It peaks at the layer where
+    compression is maximal.  The injection layer is one layer AFTER this
+    peak — the model has organized the facts but hasn't yet converged to
+    output-format (cross-distance still elevated).
+
+    Falls back to ``num_layers - 6`` if calibration data is too short.
     """
     return max(20, min(num_layers - 4, num_layers - 6))
+
+
+def detect_injection_layer(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    window_tokens: list[list[int]],
+    calibration_text: str | None = None,
+) -> int:
+    """Detect injection layer by measuring within-vs-cross residual compression.
+
+    Args:
+        model: The loaded HuggingFace model.
+        tokenizer: Tokenizer matching the model.
+        window_tokens: At least 2 windows of token IDs from the same article.
+        calibration_text: A short unrelated text for cross-context comparison.
+            Defaults to a fixed neutral sentence if ``None``.
+
+    Returns:
+        0-indexed layer number for injection (e.g. 30 for Qwen3-4B).
+    """
+    num_layers = model.config.num_hidden_layers
+
+    if len(window_tokens) < 2:
+        return _detect_injection_layer(num_layers)
+
+    c_text = calibration_text or "The weather today is mild with clear skies."
+    calib_ids = tokenizer.encode(c_text, add_special_tokens=True)[:100]
+    if len(calib_ids) < 10:
+        return _detect_injection_layer(num_layers)
+
+    w1 = window_tokens[0]
+    w2 = window_tokens[1]
+    # Ensure reasonable length
+    w1 = w1[:min(len(w1), 100)]
+    w2 = w2[:min(len(w2), 100)]
+
+    if len(w1) < 10 or len(w2) < 10:
+        return _detect_injection_layer(num_layers)
+
+    embed = model.get_input_embeddings()
+    device = next(model.parameters()).device
+
+    with torch.inference_mode():
+        h1 = embed(torch.tensor([w1], dtype=torch.long, device=device))
+        h2 = embed(torch.tensor([w2], dtype=torch.long, device=device))
+        h_c = embed(torch.tensor([calib_ids], dtype=torch.long, device=device))
+
+        p1 = torch.arange(0, h1.shape[1], device=device).unsqueeze(0)
+        p2 = torch.arange(0, h2.shape[1], device=device).unsqueeze(0)
+        pc = torch.arange(0, h_c.shape[1], device=device).unsqueeze(0)
+
+        within_dists = []
+        cross_dists = []
+
+        for layer_idx in range(num_layers):
+            ly = model.model.layers[layer_idx]
+            pe1 = model.model.rotary_emb(h1, p1)
+            pe2 = model.model.rotary_emb(h2, p2)
+            pec = model.model.rotary_emb(h_c, pc)
+
+            h1 = ly(h1, attention_mask=None, position_ids=p1,
+                     position_embeddings=pe1)
+            h2 = ly(h2, attention_mask=None, position_ids=p2,
+                     position_embeddings=pe2)
+            h_c = ly(h_c, attention_mask=None, position_ids=pc,
+                      position_embeddings=pec)
+
+            r1 = h1[:, -1, :].float()
+            r2 = h2[:, -1, :].float()
+            rc = h_c[:, -1, :].float()
+
+            w_d = 1.0 - torch.nn.functional.cosine_similarity(r1, r2, dim=-1).item()
+            c_d = 1.0 - torch.nn.functional.cosine_similarity(r1, rc, dim=-1).item()
+            within_dists.append(w_d)
+            cross_dists.append(c_d)
+
+    # Find peak within-distance in the retrieval zone [crystal+2, num_layers-3]
+    crystal = max(20, num_layers * 2 // 3)  # rough estimate
+    start = min(crystal + 2, num_layers - 4)
+    end = num_layers - 2
+    peak_idx = start
+
+    for i in range(start, end):
+        # Use within/cross ratio to find the compression peak
+        if cross_dists[i] > 0.01:
+            ratio = within_dists[i] / cross_dists[i]
+        else:
+            ratio = within_dists[i]
+
+        # Check if this is a local maximum of within-distance
+        if i > start and within_dists[i] > within_dists[i - 1]:
+            peak_idx = i
+
+        # Also consider the ratio peak
+        if i > start:
+            prev_ratio = (within_dists[i-1] / max(cross_dists[i-1], 0.01)
+                          if cross_dists[i-1] > 0.01 else within_dists[i-1])
+            if ratio > prev_ratio:
+                peak_idx = i
+
+    # Injection layer = peak + 1 (one layer after max compression)
+    detected = min(peak_idx + 1, num_layers - 2)
+    detected = max(20, detected)
+
+    return detected
 
 
 def _sample(logits, temperature, top_k, top_p):

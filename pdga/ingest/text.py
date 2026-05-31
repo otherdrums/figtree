@@ -2,7 +2,7 @@
 
 The pipeline:
 1. Auto-detect crystal layer using the first portion of the text
-2. Injection layer = num_layers - 4 (LARQL Apollo pattern)
+2. Auto-detect injection layer via residual compression analysis
 3. Split text into token windows
 4. For each window, capture boundary residual at crystal layer (last token)
 5. GLiNER extracts entities; entity token IDs stored as injection entries
@@ -22,6 +22,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from pdga.delta.base import DeltaManifest, Delta
 from pdga.delta.context import ContextDelta
 from pdga.ingest.extractor import detect_crystal_layer
+from pdga.kernel.corrected import detect_injection_layer
 from pdga.ingest.gliner_extractor import (
     GlinerExtractor,
     extract_fact_entities_for_window,
@@ -65,8 +66,6 @@ def ingest_text(
             calibration_text=text[:2000],
         )
 
-    injection_layer = max(1, num_layers - 4)
-
     token_ids_all = tokenizer.encode(text)
     if not token_ids_all:
         raise ValueError("Text produced zero tokens after encoding")
@@ -75,6 +74,10 @@ def ingest_text(
         token_ids_all[i : i + window_size]
         for i in range(0, len(token_ids_all), window_size)
     ]
+
+    injection_layer = detect_injection_layer(
+        model, tokenizer, windows, calibration_text=text[:1000],
+    )
 
     all_boundaries = []
     all_injection_token_ids: list[list[int]] = []
