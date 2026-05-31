@@ -10,3 +10,4 @@ build/
 *.pdga/
 deltas/
 !temp_deltas/
+*.gguf
