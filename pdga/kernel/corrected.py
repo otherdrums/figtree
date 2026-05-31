@@ -1,27 +1,35 @@
-"""Corrected residual injection engine — full forward, no boundary skip.
+"""Corrected residual injection engine.
 
-Based on LARQL Apollo's actual implementation keys:
-1. Injection at L30 (injection_layer), NOT L23 (crystal).
-2. Top-K=8 entries, routed by token-overlap with query.
-3. Context = matched window tokens + query tokens.
-4. inject_coefficient = 10.0.
+Three key fixes from LARQL Apollo's actual semantics:
 
-The boundary residual is NOT used for position-0 substitution on Qwen3 —
-HuggingFace attention cannot mix L23-level boundary with L0-level token
-embeddings at the crystal layer.  Instead we use the full (uncompressed)
-forward pass over all context tokens, with injection at L30."""
+1. Injection at L(num_layers - 6), NOT at crystal_layer.
+   LARQL research: L23 features are noisy "population code." L30+ features
+   are context-selective — injecting there adds signal the MLP can use.
+
+2. Top-K=8 entries, routed by token-overlap between query and stored
+   window tokens.  (Previously: 260+ entries summed blindly.)
+
+3. Context = matched window tokens + prompt tokens.
+   The original text tokens give the model the background it needs to
+   resolve injected entity embeddings into specific facts.
+
+The boundary residual is NOT used for position-0 substitution on
+Qwen3/HuggingFace — HF attention cannot mix L23-level boundary with
+L0-level token embeddings at the same layer.
+"""
 
 from __future__ import annotations
 
 import time
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers.cache_utils import DynamicCache
 
 from pdga.delta.context import ContextDelta
 from pdga.kernel.prompt import build_prompt_ids
 
 
-def generate_corrected(
+def generate_multi_corrected(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     prompt: str,
@@ -30,15 +38,15 @@ def generate_corrected(
     sample_temp: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.95,
-    injection_layer: int = 30,
     injection_coefficient: float = 10.0,
     injection_topk: int = 8,
+    injection_layer: int | None = None,
     eos_token_id: int | None = None,
 ) -> list[dict]:
-    """Generate with LARQL-corrected injection semantics.
+    """Generate from multiple deltas in parallel with corrected injection.
 
-    Full forward pass (uncompressed) over [window_tokens + generated_tokens]
-    with injection delta at `injection_layer`.
+    Each delta gets its own window-token context + routed injection entries.
+    KV caching speeds up the full forward pass.
     """
     device = model.device
     dtype = model.dtype
@@ -49,90 +57,139 @@ def generate_corrected(
     num_layers = model.config.num_hidden_layers
     eos = eos_token_id or tokenizer.eos_token_id
 
+    if injection_layer is None:
+        injection_layer = _detect_injection_layer(num_layers)
+
     prompt_ids = build_prompt_ids(tokenizer, prompt, enable_thinking=False)
+    P = len(prompt_ids)
 
-    results = []
-
+    # Pre-compute per-delta data
+    delta_data = []
     for delta in deltas:
-        boundaries = delta.boundaries
-        if boundaries is None or boundaries.shape[0] == 0:
-            results.append({
-                "delta_id": delta.delta_id, "trust": delta.trust,
-                "generated_text": "[no boundaries]", "mode": "corrected",
-            })
-            continue
-
-        # Route entries by token overlap with query
-        entries = _route_and_retrieve(
-            delta, prompt_ids, injection_topk, device, dtype,
-        )
+        entries = _route_and_retrieve(delta, prompt_ids, injection_topk)
         if not entries:
-            results.append({
-                "delta_id": delta.delta_id, "trust": delta.trust,
-                "generated_text": "[no matching windows]", "mode": "corrected",
-            })
             continue
 
-        # Injection delta from top entries
+        # Injection delta
         inj_ids = torch.tensor([e[0] for e in entries], device=device)
-        inj_coeffs_t = torch.tensor(
-            [e[1] for e in entries], device=device, dtype=torch.float32
-        ).to(dtype=dtype)
+        inj_coeffs = torch.tensor([e[1] for e in entries], dtype=torch.float32, device=device).to(dtype)
         inj_embs = embed(inj_ids)
-        injection_delta = (
-            inj_embs * inj_coeffs_t.unsqueeze(-1) * injection_coefficient
-        ).sum(dim=0)
+        injection_delta = (inj_embs * inj_coeffs.unsqueeze(-1) * injection_coefficient).sum(dim=0)
 
-        # Build context: matched window tokens + prompt tokens
         matched_window = entries[0][2]
         window_tokens = list(delta.get_window_tokens(matched_window))
 
-        gen_ids = list(prompt_ids)
-        P = len(prompt_ids)
+        delta_data.append({
+            "delta": delta,
+            "injection_delta": injection_delta,
+            "window_tokens": window_tokens,
+            "matched_window": matched_window,
+            "num_entries": len(entries),
+        })
 
-        t0 = time.perf_counter()
+    if not delta_data:
+        return []
 
-        with torch.inference_mode():
-            for step in range(max_new_tokens):
-                all_ids = window_tokens + gen_ids
-                tok_emb = embed(
-                    torch.tensor([all_ids], dtype=torch.long, device=device)
+    num_deltas = len(delta_data)
+    gen_ids = [list(prompt_ids) for _ in range(num_deltas)]
+    active = [True] * num_deltas
+
+    # Prefill: run [window_tokens + prompt] through all layers with KV cache
+    per_delta_caches = []
+    per_delta_logits = []
+
+    with torch.inference_mode():
+        for d in range(num_deltas):
+            dd = delta_data[d]
+            w_tokens = dd["window_tokens"]
+            all_ids = w_tokens + prompt_ids
+            L = len(all_ids)
+            tok_emb = embed(torch.tensor([all_ids], dtype=torch.long, device=device))
+            h = tok_emb
+            pos_ids = torch.arange(0, L, device=device).unsqueeze(0)
+            cache = DynamicCache()
+
+            for layer_idx in range(num_layers):
+                lay = model.model.layers[layer_idx]
+                pe = rotary(h, pos_ids)
+                h = lay(
+                    h,
+                    attention_mask=None,
+                    position_ids=pos_ids,
+                    position_embeddings=pe,
+                    use_cache=True,
+                    past_key_values=cache,
                 )
-                h = tok_emb
-                L = h.shape[1]
-                pos_ids = torch.arange(0, L, device=device).unsqueeze(0)
 
-                # Full forward through all layers
+                if layer_idx == injection_layer and dd["injection_delta"] is not None:
+                    h[:, -1, :] = h[:, -1, :] + dd["injection_delta"].unsqueeze(0)
+
+            h = norm(h)
+            logits = lm_head(h[:, -1:, :])
+            per_delta_logits.append(logits)
+            per_delta_caches.append(cache)
+
+    t0 = time.perf_counter()
+
+    # Decode loop
+    with torch.inference_mode():
+        for step in range(max_new_tokens):
+            if not any(active):
+                break
+
+            new_tokens = []
+            for d in range(num_deltas):
+                if not active[d]:
+                    new_tokens.append(None)
+                    continue
+                nxt = _sample(per_delta_logits[d], sample_temp, top_k, top_p)
+                if nxt == eos:
+                    active[d] = False
+                    new_tokens.append(None)
+                else:
+                    new_tokens.append(nxt)
+                    gen_ids[d].append(nxt)
+
+            if not any(active):
+                break
+
+            for d in range(num_deltas):
+                if not active[d]:
+                    continue
+                tok = new_tokens[d]
+                pos = len(delta_data[d]["window_tokens"]) + len(gen_ids[d])
+                tok_emb = embed(torch.tensor([[tok]], device=device))
+                h = tok_emb
+                pos_id_tok = torch.tensor([[pos]], device=device, dtype=torch.long)
+                cache = per_delta_caches[d]
+
                 for layer_idx in range(num_layers):
                     lay = model.model.layers[layer_idx]
-                    pe = rotary(h, pos_ids)
+                    pe = rotary(h, pos_id_tok)
                     h = lay(
                         h,
                         attention_mask=None,
-                        position_ids=pos_ids,
+                        position_ids=pos_id_tok,
                         position_embeddings=pe,
+                        use_cache=True,
+                        past_key_values=cache,
                     )
 
-                    # Inject at injection_layer (L30)
-                    if layer_idx == injection_layer:
-                        last = L - 1
-                        h[:, last:last+1, :] = (
-                            h[:, last:last+1, :]
-                            + injection_delta.unsqueeze(0)
-                        )
+                    if layer_idx == injection_layer and delta_data[d]["injection_delta"] is not None:
+                        h[:, 0, :] = h[:, 0, :] + delta_data[d]["injection_delta"].unsqueeze(0)
 
                 h = norm(h)
-                logits = lm_head(h[:, -1:, :])
+                per_delta_logits[d] = lm_head(h[:, -1:, :])
 
-                next_tok = _sample(logits, sample_temp, top_k, top_p)
-                if next_tok == eos:
-                    break
-                gen_ids.append(next_tok)
+    elapsed = time.perf_counter() - t0
 
-        elapsed = time.perf_counter() - t0
-        new_tokens = len(gen_ids) - P
+    results = []
+    for d in range(num_deltas):
+        dd = delta_data[d]
+        delta = dd["delta"]
+        new_tokens = len(gen_ids[d]) - P
         tps = new_tokens / elapsed if elapsed > 0 else 0.0
-        completion = tokenizer.decode(gen_ids[P:]).lstrip()
+        completion = tokenizer.decode(gen_ids[d][P:]).lstrip()
 
         results.append({
             "delta_id": delta.delta_id,
@@ -145,8 +202,8 @@ def generate_corrected(
             "num_tokens": new_tokens,
             "elapsed": elapsed,
             "injection_layer": injection_layer,
-            "matched_window": matched_window,
-            "entries_injected": len(entries),
+            "matched_window": dd["matched_window"],
+            "entries_injected": dd["num_entries"],
         })
 
     return results
@@ -156,19 +213,15 @@ def _route_and_retrieve(
     delta: ContextDelta,
     query_ids: list[int],
     topk: int,
-    device: torch.device,
-    dtype: torch.dtype,
 ) -> list[tuple[int, float, int]]:
     """Route query tokens to windows, retrieve top-K injection entries."""
     query_set = set(query_ids)
 
     window_scores = []
     for w in range(delta.num_windows):
-        w_tokens = delta.get_window_tokens(w)
-        overlap = len(set(w_tokens) & query_set)
+        overlap = len(set(delta.get_window_tokens(w)) & query_set)
         if overlap > 0:
             window_scores.append((w, overlap))
-
     window_scores.sort(key=lambda x: -x[1])
     if not window_scores:
         return []
@@ -184,6 +237,20 @@ def _route_and_retrieve(
 
     entries.sort(key=lambda x: -x[1])
     return entries[:topk]
+
+
+def _detect_injection_layer(num_layers: int) -> int:
+    """Auto-detect the injection layer.
+
+    LARQL's research shows the optimal injection point is near the end of
+    the retrieval/resolve zone, where MLP features become context-selective
+    rather than indiscriminate "population code."  Empirically:
+    - Gemma 3 4B (34L): L30  (LARQL hardcoded default)
+    - Qwen3 4B  (36L): L30  (validated)
+
+    The rule: num_layers - 6, clamped to [20, num_layers-4].
+    """
+    return max(20, min(num_layers - 4, num_layers - 6))
 
 
 def _sample(logits, temperature, top_k, top_p):
