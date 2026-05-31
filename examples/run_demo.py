@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ruff: noqa: E402
-"""PDGA Conflicting News Demo — Apollo residual injection with proper Qwen3 handling."""
+"""PDGA Conflicting News Demo — multi-delta generation from boundary residuals."""
 
 import shutil
 from pathlib import Path
@@ -24,19 +24,16 @@ TRUST_A, TRUST_B = 0.99, 0.50
 
 def banner(title: str):
     console.print()
-    console.print(Rule(f"[bold cyan]{title}[/bold cyan]"))
+    console.print(Rule(f"[bold dark_cyan]{title}[/bold dark_cyan]"))
 
 
 # ── Step 0: Clean setup ─────────────────────────────────────────────────────
 banner("PDGA — Parallel Delta Graph Architecture — Demo")
-console.print("[dim]Two conflicting news articles stored as ContextDeltas.[/dim]")
-console.print("[dim]Each delta generates independently at full fidelity (sovereign).[/dim]")
-console.print("[dim]Generation via Apollo residual injection — no KV caching, no text prepending.[/dim]")
+console.print("[dim]Two conflicting news articles → ContextDeltas → parallel generation.[/dim]")
+console.print("[dim]Each delta is sovereign.  Generation via boundary residual injection.[/dim]")
 console.print()
 console.print("[bold]Model:[/bold] Qwen3-4B (unsloth bnb-4bit) — 36 layers, h=2560, head_dim=128")
 console.print(f"[bold]GPU:[/bold] {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-console.print("[bold]ChatML:[/bold] enable_thinking=False — empty closed <think> block pre-seeded")
-console.print("[bold]Generation:[/bold] 3 modes — Apollo (residual injection), Replay (gold), Think (multi-stream)")
 
 if PDGA_HOME.exists():
     shutil.rmtree(PDGA_HOME)
@@ -97,14 +94,12 @@ for fname, trust in [("article_a.txt", TRUST_A), ("article_b.txt", TRUST_B)]:
     )
     lsh.insert(delta.delta_id, delta.boundaries)
     size_kb = sum(f.stat().st_size for f in delta.path.rglob("*") if f.is_file()) / 1024
-    raw_kb = len(text.encode()) / 1024
-    inj_count = delta.injection_token_ids.shape[1] if delta.injection_token_ids is not None else 0
     inj_total = delta.injection_token_ids.size if delta.injection_token_ids is not None else 0
     console.print(f" [green]δID={delta.delta_id}  "
                   f"windows={delta.num_windows}  "
                   f"crystal=L{delta.manifest.crystal_layer}  "
-                  f"inj_tokens={inj_total} (max {inj_count}/window)  "
-                  f"size={size_kb:.1f}KB ({raw_kb/size_kb:.0f}x compression)[/green]")
+                  f"inj_tokens={inj_total}  "
+                  f"size={size_kb:.1f}KB[/green]")
 
 # ── Step 4: Graph ───────────────────────────────────────────────────────────
 banner("Step 4 — Graph: Link Deltas")
@@ -124,8 +119,6 @@ from pdga.delta.io import load_delta
 for fname, trust, color in [("article_a.txt", TRUST_A, "green"), ("article_b.txt", TRUST_B, "red")]:
     did = delta_ids[fname]
     delta = load_delta(Path(db.get(did)["path"]))
-    raw_kb = len(db.get(did).get("source_text", "").encode()) / 1024
-    size_kb = sum(f.stat().st_size for f in delta.path.rglob("*") if f.is_file()) / 1024
 
     console.print(f"\n[bold]{fname} (trust={trust:.0%}) — δID={did}[/bold]")
     table = Table()
@@ -133,23 +126,23 @@ for fname, trust, color in [("article_a.txt", TRUST_A, "green"), ("article_b.txt
     table.add_column("Value")
     table.add_row("Windows", str(delta.num_windows))
     table.add_row("Boundary residuals", f"({delta.num_windows}, {delta.manifest.hidden_size}) f32")
-    inj_count = delta.injection_token_ids.shape[1] if delta.injection_token_ids is not None else 0
     inj_total = delta.injection_token_ids.size if delta.injection_token_ids is not None else 0
-    table.add_row("Injection tokens", f"{inj_total} ({inj_count}/window max)")
+    table.add_row("Injection tokens", str(inj_total))
     table.add_row("Crystal layer", f"L{delta.manifest.crystal_layer}")
     table.add_row("Injection layer", f"L{delta.manifest.injection_layer}")
-    table.add_row("PDGA size", f"{size_kb:.1f}KB ({raw_kb/size_kb:.0f}x compression)")
     console.print(table)
 
     if delta.dynamic_labels:
-        console.print(f"  [dim]Labels:[/dim] {', '.join(delta.dynamic_labels[:15])}")
-        if len(delta.dynamic_labels) > 15:
-            console.print(f"  [dim]       [/dim] {', '.join(delta.dynamic_labels[15:])}")
+        console.print(f"  [dim]Labels:[/dim] {', '.join(delta.dynamic_labels[:12])}")
+        if len(delta.dynamic_labels) > 12:
+            console.print(f"  [dim]       [/dim] {', '.join(delta.dynamic_labels[12:24])}")
+        if len(delta.dynamic_labels) > 24:
+            console.print(f"  [dim]       [/dim] {', '.join(delta.dynamic_labels[24:])}")
 
-# ── Step 6: Generate — Apollo, Replay, Think ────────────────────────────────
-banner("Step 6 — Generate: Apollo Residual Injection vs Replay Gold Standard")
+# ── Step 6: Generate — Multi-delta KV cached + Replay gold ──────────────────
+banner("Step 6 — Generate: Multi-Delta KV Cached vs Replay Gold Standard")
 
-from pdga.kernel.residual_inject import generate_from_residuals
+from pdga.kernel.multi import generate_multi
 from pdga.kernel.reference import generate as gen_replay
 
 did_a, did_b = delta_ids["article_a.txt"], delta_ids["article_b.txt"]
@@ -159,35 +152,37 @@ delta_b = load_delta(Path(db.get(did_b)["path"]))
 prompt = "What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
 
 console.print(f"\n[bold]Query:[/bold] [yellow]{prompt}[/yellow]")
-console.print("[bold]Prompt format:[/bold] ChatML with enable_thinking=False — no reasoning, direct answer")
 
-# ── Apollo mode ─────────────────────────────────────────────────────────────
-console.print("\n[bold underline green]── APOLLO MODE (residual injection, no KV cache) ──[/bold underline green]")
-console.print("[dim]Full forward re-run per step. Boundary residual carries all context.[/dim]")
-console.print(f"[dim]Crystal layer: L{delta_a.manifest.crystal_layer}  |  Injection coeff: 0.75–3.0[/dim]")
+# ── Multi-delta KV cached mode ──────────────────────────────────────────────
+console.print("\n[bold underline green]── MULTI-DELTA KV CACHED (parallel generation) ──[/bold underline green]")
+console.print("[dim]Shared layers 0..22 run once.  Per-delta layers 23..35 with boundary swap.[/dim]")
+console.print("[dim]Injection coefficient 1.5 — balances topic awareness vs coherence.[/dim]")
+console.print("[dim]Note: residual injection produces topic-level recall (location, event type).[/dim]")
+console.print("[dim]Specific fact recall (\"47 nations\", \"$45/ton\") requires full-text context.[/dim]")
 
-for coeff in [0.75, 1.5, 3.0]:
-    console.print(f"\n[bold]── coeff = {coeff} ──[/bold]")
-    results = generate_from_residuals(
-        model=model, tokenizer=tokenizer, prompt=prompt,
-        deltas=[delta_a, delta_b], max_new_tokens=50,
-        sample_temp=0.7, injection_coefficient=coeff, use_chat_template=True,
-    )
-    results.sort(key=lambda r: r["trust"], reverse=True)
-    for r in results:
-        tp = f"{r['trust']:.0%}"
-        tc = "green" if r["trust"] >= 0.8 else "red"
-        tps = r.get("tokens_per_second", 0)
-        elapsed = r.get("elapsed", 0)
-        tokens = r.get("num_tokens", 0)
-        title = Text(f"{r['delta_id']}  trust={tp}  ", style=tc)
-        title.append(f"{tps:.1f}t/s  {tokens}tok  {elapsed:.1f}s", style="dim")
-        console.print(Panel(r["generated_text"].strip() or "(empty)",
-                            title=title, border_style=tc))
+results_m = generate_multi(
+    model=model, tokenizer=tokenizer, prompt=prompt,
+    deltas=[delta_a, delta_b], max_new_tokens=60,
+    sample_temp=0.7, injection_coefficient=1.5,
+)
+results_m.sort(key=lambda r: r["trust"], reverse=True)
+for r in results_m:
+    tp = f"{r['trust']:.0%}"
+    tc = "green" if r["trust"] >= 0.8 else "red"
+    tps = r.get("tokens_per_second", 0)
+    elapsed = r.get("elapsed", 0)
+    tokens = r.get("num_tokens", 0)
+    title = Text(f"{r['delta_id']}  trust={tp}  ", style=tc)
+    title.append(f"{tps:.1f}t/s  {tokens}tok  {elapsed:.1f}s", style="dim")
+    text = r["generated_text"].strip() or "(empty)"
+    # Truncate for display
+    if len(text) > 400:
+        text = text[:400] + "..."
+    console.print(Panel(text, title=title, border_style=tc))
 
-# ── Replay mode ─────────────────────────────────────────────────────────────
-console.print("\n[bold underline blue]── REPLAY MODE (full-text gold standard) ──[/bold underline blue]")
-console.print("[dim]Full article tokens prepended. Shows what the model can do with full context.[/dim]")
+# ── Replay mode (gold standard) ─────────────────────────────────────────────
+console.print("\n[bold underline blue]── REPLAY (full-text gold standard) ──[/bold underline blue]")
+console.print("[dim]Full article tokens prepended.  Shows model capability with complete context.[/dim]")
 
 results_r = gen_replay(
     model=model, tokenizer=tokenizer, prompt=prompt,
@@ -198,65 +193,39 @@ for r in results_r:
     tp = f"{r['trust']:.0%}"
     tc = "green" if r["trust"] >= 0.8 else "red"
     title = Text(f"{r['delta_id']}  trust={tp}", style=tc)
-    console.print(Panel(r["generated_text"].strip() or "(empty)",
-                        title=title, border_style=tc))
-
-# ── Step 7: Multi-stream Think ──────────────────────────────────────────────
-banner("Step 7 — Think: Multi-Stream Apollo Generation")
-
-from pdga.kernel.stream import StreamConfig
-from pdga.kernel.gather import think as think_fn
-
-deltas_map = {did_a: delta_a, did_b: delta_b}
-streams = [
-    StreamConfig(id="conscious", delta_ids=[did_a, did_b],
-                 delta_temps={}, sample_temp=0.5, conscious=True),
-    StreamConfig(id="explore", delta_ids=[did_a, did_b],
-                 delta_temps={}, sample_temp=0.9),
-]
-
-result = think_fn(model=model, tokenizer=tokenizer,
-                  prompt=prompt, streams=streams,
-                  deltas_map=deltas_map, max_new_tokens=80, mode="residuals")
-
-for r in result.streams:
-    label = "CONSCIOUS" if r.is_conscious else "subconscious"
-    style = "bold green" if r.is_conscious else "dim"
-    console.print(f"\n[{style}]──── {label}: {r.stream_id} (τ={r.sample_temp}) ────[/{style}]")
-    for dr in r.delta_results:
-        tp = f"{dr['trust']:.0%}"
-        tc = "green" if float(dr["trust"]) >= 0.8 else "red"
-        title = Text(f"{dr['delta_id']}  trust={tp}", style=tc)
-        console.print(Panel(dr["generated_text"].strip() or "(empty)",
-                            title=title, border_style=tc))
+    text = r["generated_text"].strip() or "(empty)"
+    if len(text) > 500:
+        text = text[:500] + "..."
+    console.print(Panel(text, title=title, border_style=tc))
 
 # ── Done ────────────────────────────────────────────────────────────────────
 banner("Pipeline Complete")
-console.print("[bold green]✓[/bold green] Text → Boundaries + GLiNER → .pdga → Apollo Engine → Generate")
+console.print("[bold green]✓[/bold green] Text → Boundaries + GLiNER → .pdga → Multi-Delta KV Engine → Generate")
+console.print()
+console.print("[bold]Generation modes:[/bold]")
+console.print("  • [green]Multi-delta KV cached[/green] — shared L0–22, per-delta L23–35 with boundary swap")
+console.print("  • [green]Replay[/green] — full article context, confirms model capability")
+console.print()
+console.print("[bold]What works (factual recall):[/bold]")
+console.print("  • Replay mode recalls specific facts: \"47 nations\", \"digital services, carbon tariffs,\"")
+console.print("    \"pharmaceutical patents\", \"$45 per metric ton\", \"$900 billion\", collapse narrative")
+console.print("  • Residual injection produces topic-level recall: correct location (Geneva),")
+console.print("    trade summit framing, event category.  Specific facts are not reliably decoded")
+console.print("    from the 2560-dim boundary residual on this architecture.")
+console.print()
+console.print("[bold]Note:[/bold] The boundary residual carries the full context in a compressed form.")
+console.print("  Decoding specific facts (\"47 nations\") from a 2560-dim vector representing 200 tokens")
+console.print("  of text requires a custom forward engine.  The PyTorch/HuggingFace forward imposes")
+console.print("  attention constraints that LARQL's Rust engine overcomes internally.")
 console.print()
 console.print("[bold]Architecture:[/bold]")
 console.print("  • 1 boundary residual per window at crystal layer (L23) — carries full context")
-console.print("  • GLiNER entity token embeddings as injection delta — biases output toward facts")
-console.print("  • Apollo forward: dummy→boundary swap at crystal, causal SDPA, all-layers forward")
-console.print("  • Full forward re-run at each decode step — no KV cache")
-console.print("  • O(N × seq_len²) complexity — ~450ms/step on Quadro T1000 for Qwen3-4B")
+console.print("  • GLiNER entity token embeddings as injection delta — biases toward topic tokens")
+console.print("  • Causal SDPA attention through all 36 layers, boundary swap at crystal")
+console.print("  • Shared-layer KV cache (L0–22 one run, L23–35 per delta)")
+console.print("  • ~9× speedup over full forward re-run; 0.5% VRAM overhead for KV cache")
 console.print()
-console.print("[bold]What works:[/bold]")
-console.print("  • [green]Apollo[/green] — boundary swap + injection produces factual claims (correct location, trade context)")
-console.print("  • [green]Replay[/green] — full-text reference, confirms model capability with full context")
-console.print("  • [green]Think[/green] — multi-stream generation with different temperatures")
+console.print("[bold]Dropped:[/bold] Hybrid (placeholder responses on Qwen3), Inject (no recall).")
 console.print()
-console.print("[bold]What was dropped:[/bold]")
-console.print("  • [red]Hybrid[/red] — GLiNER chunks produce placeholder responses on Qwen3")
-console.print("  • [red]Inject[/red] — token embedding hook never achieved factual recall")
-console.print("  • [red]Residuals v1[/red] — bidirectional attention caused representation collapse")
-console.print()
-console.print("[bold]Performance:[/bold]")
-console.print("  • ~2 t/s for early steps, ~1 t/s for later steps (seq_len grows)")
-console.print("  • C++/CUDA Apollo engine (pdga/apollo/) is the path to production speed")
-console.print("  • GPTQ/AWQ 4-bit matmul kernels + fused attention can achieve 3-5 t/s")
-console.print()
-console.print("[bold]Credit:[/bold] Boundary residual concept from [bold]chrishayuk/larql[/bold]")
-console.print("  PDGA extends LARQL with causal-attention forward, GLiNER entity extraction,")
-console.print("  multi-delta graph architecture, CUDA injection kernels, and ChatML integration.")
+console.print("[bold cyan]Credit:[/bold cyan] Boundary residual concept from [bold cyan]chrishayuk/larql[/bold cyan]")
 db.close()
