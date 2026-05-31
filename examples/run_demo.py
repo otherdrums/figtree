@@ -13,7 +13,7 @@ from rich.rule import Rule
 
 console = Console()
 
-MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
 PDGA_HOME = Path.home() / ".pdga"
 DELTAS_DIR = Path(__file__).parent.parent / "deltas"
 EXAMPLES_DIR = Path(__file__).parent / "conflicting_news"
@@ -31,10 +31,10 @@ console.print("[dim]Two conflicting news articles stored as ContextDeltas.[/dim]
 console.print("[dim]Each delta generates independently at full fidelity (sovereign).[/dim]")
 console.print("[dim]Generation via residual stream injection (LARQL Apollo-style).[/dim]")
 console.print()
-console.print(f"[bold]Model:[/bold] {MODEL_ID}")
+console.print("[bold]Model:[/bold] Qwen3-4B (unsloth bnb-4bit) — 36 layers, hidden_size=2560")
 console.print(f"[bold]GPU:[/bold] {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-console.print("[bold]Storage:[/bold] 1 boundary residual per window + precomputed injection deltas")
-console.print("[bold]Generation:[/bold] Residual stream injection at layer L(num_layers-4)")
+console.print("[bold]Storage:[/bold] 1 boundary residual per window (L23 crystal) + GLiNER entities")
+console.print("[bold]Generation:[/bold] 4 modes — replay, hybrid, residuals, inject")
 
 if PDGA_HOME.exists():
     shutil.rmtree(PDGA_HOME)
@@ -60,7 +60,7 @@ console.print(f"[dim]{MODEL_ID} on {device}[/dim]")
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-    device_map=device, trust_remote_code=True,
+    device_map="auto", trust_remote_code=True,
 )
 model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -171,7 +171,7 @@ did_a, did_b = delta_ids["article_a.txt"], delta_ids["article_b.txt"]
 delta_a = load_delta(Path(db.get(did_a)["path"]))
 delta_b = load_delta(Path(db.get(did_b)["path"]))
 
-query = "What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
+query = "/no_think What happened at the Global Trade Summit in Geneva? Give the specific details from your source."
 
 console.print(f"\n[bold]Query:[/bold] [yellow]{query}[/yellow]")
 console.print("[bold]Prompt to model:[/bold] just the query above — no article text prepended.")
@@ -250,12 +250,11 @@ console.print("  • Inject mode: token embedding perturbation at injection laye
 console.print("  • Replay mode: full token replay (reference gold standard)")
 console.print("  • Each delta generates independently (sovereign), trust is metadata only")
 console.print()
-console.print("[bold]Model size note:[/bold] Qwen 1.5B (hidden_size=1536) has limited residual capacity.")
-console.print("  LARQL's Apollo achieves perfect recall with Gemma 3 4B (hidden_size=2560).")
-console.print("  The 67% larger hidden dimension enables richer boundary residual encoding.")
+console.print("[bold]Qwen3-4B results:[/bold] Replay and Hybrid modes produce specific fact recall.")
+console.print("  Residuals and Inject modes do not — boundary residual alone insufficient even at 2560 dims.")
+console.print("  LARQL's Apollo uses per-token VecInjectEntry with token IDs, not full residual vectors.")
 console.print()
 console.print("[bold]Credit:[/bold] Boundary residual concept from [bold]chrishayuk/larql[/bold]")
-console.print("  PDGA extends LARQL with GLiNER entity extraction, multi-delta graph")
-console.print("  architecture, and both compressed (hybrid) and experimental (injection)")
-console.print("  generation modes.")
+console.print("  PDGA extends LARQL with CUDA/Triton kernel injection, GLiNER entity extraction,")
+console.print("  multi-delta graph architecture, and multiple generation modes.")
 db.close()

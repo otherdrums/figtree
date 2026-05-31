@@ -27,7 +27,7 @@ def _load_model(model_id: str | None = None, use_4bit: bool = True):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if model_id is None:
-        model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+        model_id = "unsloth/Qwen3-4B-bnb-4bit"
 
     if _state["model"] is not None:
         return _state["model"], _state["tokenizer"]
@@ -36,10 +36,12 @@ def _load_model(model_id: str | None = None, use_4bit: bool = True):
     console.print(f"[dim]Loading {model_id} on {device}...[/dim]")
 
     kwargs = dict(trust_remote_code=True)
-    kwargs["torch_dtype"] = torch.bfloat16 if device == "cuda" else torch.float32
+    if device == "cuda":
+        kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["device_map"] = "auto"
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, device_map=device, **kwargs,
+        model_id, **kwargs,
     )
     model.eval()
 
