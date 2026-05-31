@@ -1,4 +1,4 @@
-"""Apollo-style forward pass — LARQL-compatible residual stream engine.
+"""custom forward pass — LARQL-compatible residual stream engine.
 
 Corrected algorithm (v2):
 1. Dummy token at position 0, prompt embeddings at positions 1+.
@@ -10,7 +10,7 @@ Corrected algorithm (v2):
 
 The full forward re-run at each step has O(N × seq_len²) complexity.  On a
 Quadro T1000 with Qwen3-4B (bnb-4bit, 36 layers, h=2560) this is ~450 ms/step
-for short sequences.  The C++/CUDA Apollo engine (pdga/apollo/) provides a
+for short sequences.  The C++/CUDA generation engine (pdga/generation/) provides a
 path to production-speed inference while preserving the no-cache design.
 """
 
@@ -20,14 +20,14 @@ import torch
 from transformers import PreTrainedModel
 
 
-def apollo_forward(
+def custom_forward(
     model: PreTrainedModel,
     boundary_residual: torch.Tensor,
     token_embeddings: torch.Tensor,
     crystal_layer: int,
     injection_delta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apollo forward: boundary swap at crystal layer, full-layer causal forward.
+    """custom forward: boundary swap at crystal layer, full-layer causal forward.
 
     Args:
         model: HuggingFace CausalLM (Qwen3 family).

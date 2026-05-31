@@ -1,6 +1,6 @@
 """Corrected residual injection engine.
 
-Three key fixes from LARQL Apollo's actual semantics:
+Three key fixes from LARQL generation's actual semantics:
 
 1. Injection at L(num_layers - 6), NOT at crystal_layer.
    LARQL research: L23 features are noisy "population code." L30+ features

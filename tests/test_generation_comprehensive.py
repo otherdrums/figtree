@@ -1,4 +1,4 @@
-"""PDGA Apollo Engine — Comprehensive Test Suite
+"""PDGA generation engine — Comprehensive Test Suite
 
 Tests:
 1. Factual recall with 300+ token generation (single delta)
@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from pdga.apollo.engine import generate
+from pdga.generation.engine import generate
 from pdga.kernel.prompt import build_prompt_ids
 
 console = Console()

@@ -30,7 +30,7 @@ Architecture (model-agnostic):
   - GV cache for boundaries (avoid recomputation across deltas)
 
 Usage:
-    from pdga.apollo.compressed import compressed_generate, uncompressed_generate
+    from pdga.generation.compressed import compressed_generate, uncompressed_generate
 
     # Capture boundary during ingestion (see pdga/ingest/text.py)
     boundary = capture_boundary_residual(model, text, crystal_layer)

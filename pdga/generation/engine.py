@@ -1,4 +1,4 @@
-"""PDGA Apollo Engine — multi-delta generation with KV caching and injection.
+"""PDGA generation engine — multi-delta generation with KV caching and injection.
 
 Architecture:
     Prefill: Each delta's [window_tokens, prompt_ids] → all layers → KV cache

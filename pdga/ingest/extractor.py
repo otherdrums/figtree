@@ -82,7 +82,7 @@ def detect_crystal_layer(
 def detect_injection_layer(num_layers: int) -> int:
     """Return the injection layer index where residual deltas are applied.
 
-    Uses the same pattern as LARQL Apollo: num_layers - 4. This places the
+    Uses the same pattern as LARQL generation: num_layers - 4. This places the
     injection point in the late layers where semantic processing is refined
     and the remaining layers can integrate the perturbation.
     """

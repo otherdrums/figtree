@@ -1,7 +1,7 @@
-"""Apollo-style CUDA kernel for residual stream injection.
+"""custom CUDA kernel for residual stream injection.
 
 Provides a fused CUDA C++ kernel that adds a delta vector to a specific
-position in the hidden states tensor. Used during the Apollo-style forward
+position in the hidden states tensor. Used during the custom forward
 pass where boundary residuals serve as virtual position-0 and token-embedding
 deltas are injected at the crystal layer.
 
@@ -18,7 +18,7 @@ _APOLLO_KERNEL = None
 
 
 def _get_kernel():
-    """Lazy-compile the Apollo CUDA kernel."""
+    """Lazy-compile the generation CUDA kernel."""
     global _APOLLO_KERNEL
     if _APOLLO_KERNEL is not None:
         return _APOLLO_KERNEL
@@ -29,7 +29,7 @@ def _get_kernel():
     #include <torch/extension.h>
 
     template <typename scalar_t>
-    __global__ void apollo_inject_kernel(
+    __global__ void cuda_inject_kernel(
         scalar_t* __restrict__ hidden,
         const scalar_t* __restrict__ delta,
         int hidden_size,
@@ -45,7 +45,7 @@ def _get_kernel():
 
     // Specialization for fp32
     template <>
-    __global__ void apollo_inject_kernel<float>(
+    __global__ void cuda_inject_kernel<float>(
         float* __restrict__ hidden,
         const float* __restrict__ delta,
         int hidden_size,
@@ -57,7 +57,7 @@ def _get_kernel():
         hidden[target_position * stride + tid] += delta[tid];
     }
 
-    torch::Tensor apollo_inject(
+    torch::Tensor cuda_inject(
         torch::Tensor hidden,
         torch::Tensor delta,
         int target_position
@@ -76,8 +76,8 @@ def _get_kernel():
 
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 at::ScalarType::Half, at::ScalarType::BFloat16,
-                hidden.scalar_type(), "apollo_inject_cuda", ([&] {
-                    apollo_inject_kernel<scalar_t><<<blocks, threads>>>(
+                hidden.scalar_type(), "cuda_inject_kernel", ([&] {
+                    cuda_inject_kernel<scalar_t><<<blocks, threads>>>(
                         h_ptr, d_ptr, hidden_size, target_position, stride
                     );
                 })
@@ -89,7 +89,7 @@ def _get_kernel():
     """
 
     cpp_source = """
-    torch::Tensor apollo_inject(
+    torch::Tensor cuda_inject(
         torch::Tensor hidden,
         torch::Tensor delta,
         int target_position
@@ -97,10 +97,10 @@ def _get_kernel():
     """
 
     _APOLLO_KERNEL = load_inline(
-        name="apollo_cuda",
+        name="cuda_inject_cpp",
         cpp_sources=cpp_source,
         cuda_sources=cuda_source,
-        functions=["apollo_inject"],
+        functions=["cuda_inject"],
         verbose=False,
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "-use_fast_math"],
@@ -125,7 +125,7 @@ def inject_at_position(
         hidden (same tensor, modified in-place)
     """
     kernel = _get_kernel()
-    return kernel.apollo_inject(hidden, delta, position)
+    return kernel.cuda_inject(hidden, delta, position)
 
 
 def inject_at_last(hidden: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:

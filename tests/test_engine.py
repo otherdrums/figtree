@@ -1,4 +1,4 @@
-"""Test and benchmark the Apollo Engine — compressed vs uncompressed paths.
+"""Test and benchmark the generation engine — compressed vs uncompressed paths.
 
 Validates:
 1. Factual recall from boundary residual (compressed path)
@@ -12,7 +12,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from pdga.kernel.prompt import build_prompt_ids
-from pdga.apollo.engine import generate
+from pdga.generation.engine import generate
 
 
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -54,7 +54,7 @@ def _capture_boundary(model, tokenizer, text: str, crystal_layer: int) -> torch.
 def test_single_delta():
     """Compressed vs uncompressed on one delta with known facts."""
     print("=" * 80)
-    print("APOLLO ENGINE — Single Delta Test")
+    print("generation engine — Single Delta Test")
     print("=" * 80)
 
     model, tokenizer = _load_model()
@@ -162,7 +162,7 @@ def test_single_delta():
 def test_multi_delta():
     """Multi-delta parallel generation — 2 articles with contradictory facts."""
     print("\n" + "=" * 80)
-    print("APOLLO ENGINE — Multi-Delta Test")
+    print("generation engine — Multi-Delta Test")
     print("=" * 80)
 
     model, tokenizer = _load_model()
@@ -219,7 +219,7 @@ def test_multi_delta():
 def test_multi_with_uncompressed():
     """Multi-delta: one compressed, one uncompressed (mixed paths)."""
     print("\n" + "=" * 80)
-    print("APOLLO ENGINE — Mixed Path Test (compressed + uncompressed)")
+    print("generation engine — Mixed Path Test (compressed + uncompressed)")
     print("=" * 80)
 
     model, tokenizer = _load_model()
@@ -259,7 +259,7 @@ def test_multi_with_uncompressed():
 def benchmark_speed():
     """Benchmark multi-delta speed at various batch sizes."""
     print("\n" + "=" * 80)
-    print("APOLLO ENGINE — Speed Benchmark")
+    print("generation engine — Speed Benchmark")
     print("=" * 80)
 
     model, tokenizer = _load_model()

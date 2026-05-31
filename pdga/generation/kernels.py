@@ -1,9 +1,9 @@
-"""Fused CUDA kernels for Apollo-style residual injection.
+"""Fused CUDA kernels for custom residual injection.
 
 Compiles at runtime via torch.utils.cpp_extension.load_inline().
 Provides:
-- apollo_boundary_swap: Copy boundary residual to position 0 (bf16/fp16)
-- apollo_fused_inject: Add weighted sum of token embeddings to target pos
+- boundary_swap: Copy boundary residual to position 0 (bf16/fp16)
+- fused_inject: Add weighted sum of token embeddings to target pos
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ __global__ void fused_inject_fp16_kernel(
 }
 
 // ---- Host-callable wrappers ----
-torch::Tensor apollo_boundary_swap(
+torch::Tensor boundary_swap(
     torch::Tensor hidden_in,
     torch::Tensor boundary_in
 ) {
@@ -111,7 +111,7 @@ torch::Tensor apollo_boundary_swap(
     return hidden;
 }
 
-torch::Tensor apollo_fused_inject(
+torch::Tensor fused_inject(
     torch::Tensor hidden_in,
     torch::Tensor delta_in,
     torch::Tensor coeffs_in,
@@ -151,8 +151,8 @@ torch::Tensor apollo_fused_inject(
 
 _cpp_source = r"""
 // Empty — all code is in cuda_sources (it includes torch/extension.h for PYBIND11)
-torch::Tensor apollo_boundary_swap(torch::Tensor, torch::Tensor);
-torch::Tensor apollo_fused_inject(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, float);
+torch::Tensor boundary_swap(torch::Tensor, torch::Tensor);
+torch::Tensor fused_inject(torch::Tensor, torch::Tensor, torch::Tensor, int64_t, float);
 """
 
 _cuda_kernels: dict = {}
@@ -164,10 +164,10 @@ def get_kernels():
         return _cuda_kernels
 
     _cuda_kernels = load_inline(
-        name="pdga_apollo_kernels",
+        name="pdga_generation_kernels",
         cpp_sources=_cpp_source,
         cuda_sources=_cuda_source,
-        functions=["apollo_boundary_swap", "apollo_fused_inject"],
+        functions=["boundary_swap", "fused_inject"],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
         verbose=False,

@@ -12,7 +12,7 @@ import time
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pdga.kernel.prompt import build_prompt_ids
-from pdga.apollo.compressed import compressed_generate, uncompressed_generate
+from pdga.generation.compressed import compressed_generate, uncompressed_generate
 
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
 

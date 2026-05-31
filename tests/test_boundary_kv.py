@@ -15,8 +15,8 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from pdga.ingest.text import ingest_text
-from pdga.apollo.boundary_kv import generate_boundary_kv
-from pdga.apollo.compressed import uncompressed_generate
+from pdga.generation.boundary_kv import generate_boundary_kv
+from pdga.generation.compressed import uncompressed_generate
 from pdga.kernel.prompt import build_prompt_ids
 from pdga.delta.cache_io import list_window_caches, get_cache_size_per_window
 

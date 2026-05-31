@@ -1,4 +1,4 @@
-"""Apollo engine — multi-delta generation with KV caching and injection.
+"""generation engine — multi-delta generation with KV caching and injection.
 
 Provides:
   - generate: unified multi-delta generator with injection support
@@ -8,8 +8,8 @@ Provides:
   - detect_model_features: detect model capabilities
 """
 
-from pdga.apollo.engine import generate
-from pdga.apollo.compressed import (
+from pdga.generation.engine import generate
+from pdga.generation.compressed import (
     compressed_generate,
     uncompressed_generate,
     ModelAdapter,

@@ -9,10 +9,10 @@ from article-length context on constrained GPUs.
 
 Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
 
-- **Boundary residuals** — LARQL's Apollo engine stores one residual vector per text window at the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to ~2.8MB of boundary residuals — 20,000× over full KV cache.
+- **Boundary residuals** — LARQL's generation engine stores one residual vector per text window at the crystal layer. The generation 11 transcript demo (370K tokens) compresses to ~2.8MB of boundary residuals — 20,000× over full KV cache.
 - **Crystal layer detection** — The model layer where the residual stream stabilizes, enabling early-layer skipping.
 - **"The model IS the database"** — Model weights reorganized as queryable knowledge with patches as lightweight overlays.
-- **Boundary-KV engine** — Apollo stores boundary residuals for LSH retrieval, and full KV caches for generation. This is retrieval + generation, not compression.
+- **Boundary-KV engine** — generation stores boundary residuals for LSH retrieval, and full KV caches for generation. This is retrieval + generation, not compression.
 
 PDGA extends these concepts with KV cache serialization, progressive GPU loading
 from system RAM, SDPA-based streaming attention, and a delta graph architecture.
@@ -45,7 +45,7 @@ pdga graph show
 ## Demo
 
 ```bash
-python3 examples/run_apollo_demo.py all
+python3 examples/run_demo.py all
 ```
 
 Two conflicting news articles are ingested with full KV cache capture.
@@ -75,7 +75,7 @@ pdga/
 ├── ingest/        Crystal layer detection, text→ContextDelta pipeline, KV cache capture
 ├── kernel/        Per-delta generation (corrected engine with injection)
 ├── retrieval/     LSH-based boundary residual index
-├── apollo/        Streaming generator + boundary-kv engine
+├── generation/        Streaming generator + boundary-kv engine
 └── cli/           Typer CLI
 ```
 
@@ -109,7 +109,7 @@ For each window:
 - Boundary residual captured at crystal layer
 - GLiNER extracts entities for injection entries
 
-### 2. Generation (`pdga/apollo/streaming.py`)
+### 2. Generation (`pdga/generation/streaming.py`)
 
 **Prefill** (instant — no window token re-processing):
 1. Load full KV cache from disk → CPU RAM
@@ -125,7 +125,7 @@ For each window:
 All forward passes wrapped in `torch.no_grad()` — saves ~450 MB GPU by preventing
 4-bit dequantized weight buffers from accumulating in the autograd graph.
 
-### 3. Boundary-KV Engine (`pdga/apollo/boundary_kv.py`)
+### 3. Boundary-KV Engine (`pdga/generation/boundary_kv.py`)
 
 Alternative path that loads KV caches directly into `DynamicCache` without
 the progressive layer-by-layer loading. Same causal mask fix and `no_grad`
@@ -156,15 +156,15 @@ function keeps dequantized buffers. Wrapping in `torch.no_grad()` saves ~450 MB:
 
 ```bash
 # Full demo: ingest + generate with fact verification
-python3 examples/run_apollo_demo.py all
+python3 examples/run_demo.py all
 
 # Boundary-kv end-to-end test
 python3 tests/test_boundary_kv.py
 
 # Comprehensive tests (multi-delta, facts, benchmark)
-python3 tests/test_apollo_comprehensive.py multi
-python3 tests/test_apollo_comprehensive.py facts
-python3 tests/test_apollo_comprehensive.py bench
+python3 tests/test_generation_comprehensive.py multi
+python3 tests/test_generation_comprehensive.py facts
+python3 tests/test_generation_comprehensive.py bench
 ```
 
 ## Known Limitations

@@ -25,7 +25,7 @@ pdga ingest article.txt --trust 0.99 --tags summit_event
 # List stored deltas
 pdga list-deltas
 
-# Generate with Apollo engine (multi-delta, KV cached, with injection)
+# Generate with generation engine (multi-delta, KV cached, with injection)
 pdga generate "What happened at the summit?" --deltas abc123,def456
 
 # Multi-stream parallel generation
@@ -47,7 +47,7 @@ pdga graph show
 - `pdga/ingest/` — Crystal layer detection + text→ContextDelta pipeline
 - `pdga/kernel/` — Multi-delta attention, generation, multi-stream orchestrator
 - `pdga/retrieval/` — LSH-based boundary residual index
-- `pdga/apollo/` — Apollo generation engine with KV caching and injection
+- `pdga/generation/` — generation generation engine with KV caching and injection
 - `pdga/cli/` — Typer CLI
 
 ## Model
@@ -59,7 +59,7 @@ GPU: Quadro T1000 (3GB VRAM)
 
 ### Working
 
-- **Streaming Generator** (`pdga/apollo/streaming.py`): Progressive KV loading from CPU RAM to GPU
+- **Streaming Generator** (`pdga/generation/streaming.py`): Progressive KV loading from CPU RAM to GPU
   - Full article KV cache stored in system RAM during generation (one `.pt` file per article)
   - Progressive layer-by-layer loading: each window K/V moved to GPU just before that layer's forward pass
   - Explicit causal 4D mask handles position offset (window at 0..T-1, prompt at T..T+P-1)
@@ -69,7 +69,7 @@ GPU: Quadro T1000 (3GB VRAM)
   - Speed: ~3.5–6 t/s on Quadro T1000 with 300–500 token context
   - **Demo factual recall**: 19/20 facts (95%) from 372-token article, zero cross-contamination
 
-- **Boundary-KV Engine** (`pdga/apollo/boundary_kv.py`): Instant prefill from pre-computed KV caches
+- **Boundary-KV Engine** (`pdga/generation/boundary_kv.py`): Instant prefill from pre-computed KV caches
   - Loads KV caches from disk directly into DynamicCache, skips 36-layer window token prefill
   - Sequential delta processing: each delta's KV loaded, generated, then freed before next delta
   - Same `torch.no_grad()` optimization as streaming generator
@@ -104,9 +104,9 @@ GPU: Quadro T1000 (3GB VRAM)
 - **GLiNER injection entries**: Subword fragments at uniform 1.0 coefficient — noise
   with no discriminative power. Entity routing needs a better extraction method.
 
-## Apollo Engine Architecture
+## generation engine Architecture
 
-### Streaming Generator (`pdga/apollo/streaming.py`)
+### Streaming Generator (`pdga/generation/streaming.py`)
 
 ```
 Prefill:
@@ -124,7 +124,7 @@ Decode (autoregressive, per-delta):
   3. KV cache grows by 1 position per layer per decode step
 ```
 
-### Boundary-KV Engine (`pdga/apollo/boundary_kv.py`)
+### Boundary-KV Engine (`pdga/generation/boundary_kv.py`)
 
 ```
 Prefill:
@@ -204,7 +204,7 @@ previous prompt positions.
 ## Demo Results
 
 ```bash
-python3 examples/run_apollo_demo.py all
+python3 examples/run_demo.py all
 ```
 
 **Article A (372 tokens, pro-deal):** 19/20 facts (95% recall)
@@ -227,27 +227,27 @@ B-only facts; Article B output contains no A-only facts.
 
 ```bash
 # Streaming attention correctness test (verifies SDPA output match)
-python3 -c "from pdga.apollo.streaming import StreamingGenerator; ..."
+python3 -c "from pdga.generation.streaming import StreamingGenerator; ..."
 
 # Boundary-kv end-to-end test
 python3 tests/test_boundary_kv.py
 
 # Full demo with ingestion + generation pipeline
-python3 examples/run_apollo_demo.py all
+python3 examples/run_demo.py all
 
 # Multi-delta generation test
-python3 tests/test_apollo_comprehensive.py multi
+python3 tests/test_generation_comprehensive.py multi
 
 # Factual recall test (300 tokens)
-python3 tests/test_apollo_comprehensive.py facts
+python3 tests/test_generation_comprehensive.py facts
 
 # Speed benchmark
-python3 tests/test_apollo_comprehensive.py bench
+python3 tests/test_generation_comprehensive.py bench
 ```
 
 ## Design Decisions
 
-1. **Boundary-kv is retrieval + generation, not compression**: LARQL's Apollo is
+1. **Boundary-kv is retrieval + generation, not compression**: LARQL's generation is
    a "boundary retrieval store" — boundaries for LSH retrieval, KV cache for
    generation. The compressed path (boundary at position 0) doesn't decode facts
    through HF; uncompressed path with pre-computed KV caches is the working

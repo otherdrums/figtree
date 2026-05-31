@@ -1,6 +1,6 @@
-"""Direct residual injection via Apollo-style forward pass (no KV cache).
+"""Direct residual injection via custom forward pass (no KV cache).
 
-Uses pdga.kernel.apollo_engine for LARQL-compatible forward computation:
+Uses pdga.kernel.forward for LARQL-compatible forward computation:
 1. Boundary residual at position 0 (replaces the dummy at crystal layer).
 2. Token embeddings at positions 1..P.
 3. Causal attention through all layers 0..N-1.
@@ -15,7 +15,7 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from pdga.delta.context import ContextDelta
-from pdga.kernel.apollo_engine import apollo_forward
+from pdga.kernel.forward import custom_forward
 from pdga.kernel.prompt import build_prompt_ids
 
 
@@ -32,7 +32,7 @@ def generate_from_residuals(
     injection_coefficient: float = 0.75,
     use_chat_template: bool = True,
 ) -> list[dict]:
-    """Generate via Apollo-style forward with boundary swap (no KV cache).
+    """Generate via custom forward with boundary swap (no KV cache).
 
     Each delta is sovereign. The boundary residual carries the full context;
     no per-token KV cache is stored.
@@ -96,7 +96,7 @@ def generate_from_residuals(
                     torch.tensor([generated_ids], dtype=torch.long, device=device)
                 )
 
-                h = apollo_forward(
+                h = custom_forward(
                     model=model,
                     boundary_residual=boundary_t,
                     token_embeddings=tok_emb,
