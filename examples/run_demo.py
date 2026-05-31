@@ -71,8 +71,7 @@ def do_ingest():
         ("Article A (pro-deal)", article_a, "green"),
         ("Article B (skeptical)", article_b, "red"),
     ]:
-        display = text[:600] + ("..." if len(text) > 600 else "")
-        console.print(Panel(display, title=name, border_style=color))
+        console.print(Panel(text, title=name, border_style=color))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(
@@ -137,7 +136,7 @@ def do_generate():
     console.print("  Loaded: {} layers, h={}".format(
         model.config.num_hidden_layers, model.config.hidden_size))
 
-    console.print("\n[bold underline green]── STREAMING GENERATION (full article, 200 tokens) ──[/bold underline green]")
+    console.print("\n[bold underline green]── STREAMING GENERATION (full article, 600 tokens) ──[/bold underline green]")
     console.print("[dim]Full article KV cache in system RAM → progressive GPU loading → SDPA[/dim]")
 
     gc.collect()
@@ -155,8 +154,8 @@ def do_generate():
         gen = StreamingGenerator(model, kv_path)
         r = gen.generate(
             tokenizer,
-            prompt="Extract every specific fact from this text. List every name, number, dollar amount, percentage, and location. Do not use headers or formatting — just list the facts one per line:",
-            max_new_tokens=350, sample_temp=0.7,
+            prompt="Quote verbatim every sentence from the text that contains a name, number, dollar amount, percentage, or location. Do not summarize or rephrase — copy the exact words from the source text:",
+            max_new_tokens=600, sample_temp=0.7,
         )
         results.append(r)
         del gen

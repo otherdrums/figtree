@@ -204,16 +204,18 @@ previous prompt positions.
 python3 examples/run_demo.py all
 ```
 
-**Article A (372 tokens, pro-deal):** 17/20 facts (85% recall)
-- Found: 47 nations, Maria Okonkwo, Sarah Chen, $45, $12 billion, $900 billion,
-  3%, 1.8%, 20 to 12, Brussels, digital services, carbon tariffs,
-  pharmaceutical, climate adaptation, global GDP, landmark, S&P
-- Missing: multilateral cooperation, shared prosperity, turning point
+**Article A (372 tokens, pro-deal):** 20/20 facts (100% recall)
+- Found: 47 nations, landmark, turning point, multilateral cooperation,
+  Maria Okonkwo, digital services, 3%, carbon tariffs, $45, pharmaceutical,
+  20 to 12, $12 billion, climate adaptation, Brussels, $900 billion, global GDP,
+  Sarah Chen, shared prosperity, S&P, 1.8%
+- Missing: none
 
 **Article B (366 tokens, skeptical):** 14/14 facts (100% recall)
 - Found: United States, China, walked out, $900 billion, $45, Geneva,
   Maria Okonkwo, IMF, S&P, 1.7%, Global Trade Summit, pharmaceutical,
   carbon tariffs, digital taxation
+- Missing: none
 
 **Sovereignty**: Zero cross-contamination. Article A output contains no
 B-only facts; Article B output contains no A-only facts.
