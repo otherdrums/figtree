@@ -5,8 +5,9 @@ The pipeline:
 2. Auto-detect injection layer via residual compression analysis
 3. Split text into token windows
 4. For each window, capture boundary residual at crystal layer (last token)
-5. GLiNER extracts entities; entity token IDs stored as injection entries
-6. Store as ContextDelta: boundaries + injection token IDs + fact chunks
+5. For each window, capture full KV cache for boundary-kv generation
+6. GLiNER extracts entities; entity token IDs stored as injection entries
+7. Store as ContextDelta: boundaries + injection token IDs + KV cache + fact chunks
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Optional
 import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers.cache_utils import DynamicCache
 
 from pdga.delta.base import DeltaManifest, Delta
 from pdga.delta.context import ContextDelta
@@ -27,6 +29,7 @@ from pdga.ingest.gliner_extractor import (
     GlinerExtractor,
     extract_fact_entities_for_window,
 )
+from pdga.delta.cache_io import save_window_cache
 
 _gliner: Optional[GlinerExtractor] = None
 
@@ -86,6 +89,11 @@ def ingest_text(
     dynamic_labels: set[str] = set()
     window_token_lists = []
 
+    # Generate delta_id and create .pdga directory early for KV cache storage
+    delta_id = Delta.generate_id(text[:10000])
+    delta_dir = output_dir / f"{delta_id}.pdga"
+    delta_dir.mkdir(parents=True, exist_ok=True)
+
     per_token_residuals = None
 
     def capture_hook(module, input, output):
@@ -104,9 +112,21 @@ def ingest_text(
                     continue
 
                 input_ids = torch.tensor([window_tokens], dtype=torch.long, device=device)
-                attn_mask = torch.ones_like(input_ids)
+                L = len(window_tokens)
+                pos_ids = torch.arange(0, L, device=device, dtype=torch.long).unsqueeze(0)
 
-                _ = model(input_ids=input_ids, attention_mask=attn_mask)
+                # Manual forward with DynamicCache to capture KV cache
+                h = model.get_input_embeddings()(input_ids)
+                cache = DynamicCache()
+
+                for li in range(num_layers):
+                    layer = model.model.layers[li]
+                    pe = model.model.rotary_emb(h, pos_ids)
+                    h = layer(
+                        h, attention_mask=None, position_ids=pos_ids,
+                        position_embeddings=pe, use_cache=True,
+                        past_key_values=cache,
+                    )
 
                 if per_token_residuals is None:
                     raise RuntimeError(f"Layer {crystal_layer} hook did not fire")
@@ -116,6 +136,10 @@ def ingest_text(
 
                 boundary = residuals[seq_len - 1].copy()
                 all_boundaries.append(boundary)
+
+                # Save KV cache for boundary-kv generation
+                save_window_cache(cache, delta_dir, i, num_layers)
+                del cache  # free GPU memory — cache already saved to disk
 
                 window_fact_chunks, entity_positions, w_labels = extract_fact_entities_for_window(
                     window_tokens, residuals, gliner, tokenizer,
@@ -136,9 +160,11 @@ def ingest_text(
                 dynamic_labels.update(w_labels)
                 window_token_lists.append(window_tokens)
                 per_token_residuals = None
+                del window_tokens  # free variable
 
-                if i % 10 == 0 and torch.cuda.is_available():
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                gc.collect()
 
     finally:
         handle.remove()
@@ -155,7 +181,6 @@ def ingest_text(
         token_ids_arr[i, :len(ids)] = ids
         coeffs_arr[i, :len(coeffs)] = coeffs
 
-    delta_id = Delta.generate_id(text[:10000])
     hidden_size = model.config.hidden_size
 
     manifest = DeltaManifest(
