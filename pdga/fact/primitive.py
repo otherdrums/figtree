@@ -9,11 +9,14 @@ Everything is a Fact:
 
 Storage (v2 .pdga format):
     fact.pdga/
-    ├── manifest.json    # fact_id, children, meta, sources, trust
-    ├── boundary.npy     # (hidden_size,) float32 — ONLY stored representation
-    └── text.txt         # Natural language statement
+    ├── manifest.json     # fact_id, children, meta, sources, trust
+    ├── boundary.npy      # (hidden_size,) float32 — crystal layer (backward compat)
+    ├── boundaries.npy    # (num_layers, hidden_size) float32 — per-layer boundaries
+    ├── boundary_emb.npy  # (hidden_size,) float32 — last-token embedding
+    └── text.txt          # Natural language statement
 
-No pre-computed KV cache. No window_tokens. Just boundary + text.
+No pre-computed KV cache. Boundaries (~10 KB each, ~360 KB for all layers) enable
+on-the-fly KV projection at generation time.
 """
 
 from __future__ import annotations
@@ -31,17 +34,19 @@ import numpy as np
 class Fact:
     """A single atomic unit of knowledge."""
 
-    fact_id: str          # SHA-256(text)[:16]
-    text: str             # Natural language statement
-    boundary: np.ndarray  # (hidden_size,) float32 — the ONLY stored tensor
-    meta: dict[str, Any]  # edge_type, about_fact, etc.
-    children: list[str]   # Child fact IDs (narratives = facts with children)
-    sources: list[str]    # Parent fact IDs
-    trust: float          # Cached trust score
+    fact_id: str                # SHA-256(text)[:16]
+    text: str                   # Natural language statement
+    boundary: np.ndarray        # (hidden_size,) float32 — crystal layer (backward compat)
+    meta: dict[str, Any]        # edge_type, about_fact, etc.
+    children: list[str]         # Child fact IDs (narratives = facts with children)
+    sources: list[str]          # Parent fact IDs
+    trust: float                # Cached trust score
+    boundaries: np.ndarray | None = None  # (num_layers, hidden_size) float32 — all layers
+    boundary_emb: np.ndarray | None = None  # (hidden_size,) float32 — last-token embedding
 
     @property
     def hidden_size(self) -> int:
-        return self.boundary.shape[0]
+        return self.boundaries.shape[1] if self.boundaries is not None else self.boundary.shape[0]
 
     @classmethod
     def create(
@@ -52,6 +57,8 @@ class Fact:
         children: list[str] | None = None,
         sources: list[str] | None = None,
         trust: float = 0.5,
+        boundaries: np.ndarray | None = None,
+        boundary_emb: np.ndarray | None = None,
     ) -> "Fact":
         """Factory: auto-generate fact_id from text."""
         fact_id = hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -59,6 +66,8 @@ class Fact:
             fact_id=fact_id,
             text=text,
             boundary=boundary.astype(np.float32),
+            boundaries=boundaries.astype(np.float32) if boundaries is not None else None,
+            boundary_emb=boundary_emb.astype(np.float32) if boundary_emb is not None else None,
             meta=meta or {},
             children=children or [],
             sources=sources or [],
@@ -82,6 +91,10 @@ class Fact:
         }
         (fact_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
         np.save(fact_dir / "boundary.npy", self.boundary)
+        if self.boundaries is not None:
+            np.save(fact_dir / "boundaries.npy", self.boundaries)
+        if self.boundary_emb is not None:
+            np.save(fact_dir / "boundary_emb.npy", self.boundary_emb)
         (fact_dir / "text.txt").write_text(self.text)
 
         return fact_dir
@@ -92,10 +105,19 @@ class Fact:
         fact_dir = Path(fact_dir)
         manifest = json.loads((fact_dir / "manifest.json").read_text())
         boundary = np.load(fact_dir / "boundary.npy")
+        boundaries = boundary_like = None
+        bd_path = fact_dir / "boundaries.npy"
+        if bd_path.exists():
+            boundaries = np.load(bd_path)
+        emb_path = fact_dir / "boundary_emb.npy"
+        if emb_path.exists():
+            boundary_like = np.load(emb_path)
         return cls(
             fact_id=manifest["fact_id"],
             text=manifest["text"],
             boundary=boundary,
+            boundaries=boundaries,
+            boundary_emb=boundary_like,
             meta=manifest.get("meta", {}),
             children=manifest.get("children", []),
             sources=manifest.get("sources", []),

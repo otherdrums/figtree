@@ -125,14 +125,23 @@ def ingest_text_to_facts(
 
     # Ingest each sentence as a fact
     sentence_facts: list[Fact] = []
-    per_token_residuals: list[torch.Tensor] = []
+    num_layers = len(model.model.layers)
+    config = model.config
+    num_kv_heads = config.num_key_value_heads
+    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+    kv_dim = num_kv_heads * head_dim
 
-    def capture_hook(mod, inp, out):
-        o = out[0] if isinstance(out, tuple) else out
-        per_token_residuals.append(o.detach())
+    def make_hook(layer_idx, storage):
+        def hook(mod, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            storage[layer_idx] = o.detach()
+        return hook
 
-    target_layer = model.model.layers[crystal_layer]
-    handle = target_layer.register_forward_hook(capture_hook)
+    # Register hooks on all layers
+    layer_outputs: dict[int, torch.Tensor] = {}
+    handles = []
+    for li in range(num_layers):
+        handles.append(model.model.layers[li].register_forward_hook(make_hook(li, layer_outputs)))
 
     try:
         with torch.no_grad():
@@ -141,29 +150,71 @@ def ingest_text_to_facts(
                 if ids.shape[1] == 0:
                     continue
 
-                model(ids)  # forward through all layers, hook captures crystal_layer output
+                # Capture embedding output for all tokens
+                emb_out = model.get_input_embeddings()(ids)  # (1, seq_len, hidden_size)
+                boundary_emb = emb_out[0, -1, :].float().cpu()
 
-                if not per_token_residuals:
-                    raise RuntimeError(f"Hook did not fire for sentence: {sent[:50]}")
+                model(ids)  # forward through all layers, hooks capture all outputs
 
-                residual = per_token_residuals[-1][0]  # (seq_len, hidden_size)
-                boundary = residual[-1].float().cpu().numpy()  # last token
+                if len(layer_outputs) != num_layers:
+                    raise RuntimeError(f"Expected {num_layers} layer outputs, got {len(layer_outputs)}")
+
+                # Build per-layer boundaries: (num_layers, hidden_size)
+                boundaries_list = [
+                    layer_outputs[li][0, -1, :].float().cpu()
+                    for li in range(num_layers)
+                ]
+                boundaries_arr = torch.stack(boundaries_list).numpy()
+
+                boundary_crystal = boundaries_arr[crystal_layer]  # for backward compat
+
+                # ── Compute per-token per-layer K/V cache (unrotated) ──
+                seq_len = ids.shape[1]
+                kv_cache_list = []
+                for li in range(num_layers):
+                    if li == 0:
+                        h_in = emb_out[0]  # (seq_len, hidden_size)
+                    else:
+                        h_in = layer_outputs[li - 1][0]  # (seq_len, hidden_size)
+                    layer = model.model.layers[li]
+                    # Apply input_layernorm (pre-norm) before projection,
+                    # matching what the layer's forward pass does internally
+                    h_normed = layer.input_layernorm(h_in)
+                    k_unrot = layer.self_attn.k_proj(h_normed)  # (seq_len, kv_dim)
+                    v = layer.self_attn.v_proj(h_normed)  # (seq_len, kv_dim)
+                    # Handle k_norm (QK-norm after projection)
+                    k_normed = k_unrot.view(1, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+                    if hasattr(layer.self_attn, "k_norm"):
+                        k_normed = layer.self_attn.k_norm(k_normed)
+                    k_unrot = k_normed.transpose(1, 2).reshape(seq_len, kv_dim)
+                    v = v.reshape(seq_len, kv_dim)
+                    kv_cache_list.append(torch.stack([k_unrot, v], dim=1))  # (seq_len, 2, kv_dim)
+
+                kv_cache_t = torch.stack(kv_cache_list).float().cpu().numpy()  # (num_layers, seq_len, 2, kv_dim)
 
                 fact = Fact.create(
                     text=sent,
-                    boundary=boundary,
+                    boundary=boundary_crystal,
+                    boundaries=boundaries_arr,
+                    boundary_emb=boundary_emb.numpy(),
                     meta={"source_id": source_id, "crystal_layer": crystal_layer},
                     trust=trust,
                 )
                 sentence_facts.append(fact)
-                per_token_residuals.clear()
+
+                # Save fact + kv_cache immediately
+                fact_dir = fact.save(output_dir)
+                np.save(fact_dir / "kv_cache.npy", kv_cache_t)
+
+                layer_outputs.clear()
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
 
     finally:
-        handle.remove()
+        for h in handles:
+            h.remove()
 
     # Create narrative fact
     narrative = Fact.create(
@@ -182,9 +233,9 @@ def ingest_text_to_facts(
         sources=[narrative.fact_id],
     )
 
-    # Save all facts
-    all_facts = [narrative] + sentence_facts + [trust_fact]
-    for f in all_facts:
-        f.save(output_dir)
+    # Save narrative and trust (sentence facts already saved above with kv_cache)
+    narrative.save(output_dir)
+    trust_fact.save(output_dir)
 
+    all_facts = [narrative] + sentence_facts + [trust_fact]
     return all_facts
