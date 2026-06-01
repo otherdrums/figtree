@@ -8,8 +8,8 @@ KV caches are loaded, reducing GPU memory and speeding up prefill.
 from __future__ import annotations
 
 import numpy as np
+import torch
 from pathlib import Path
-from typing import Optional
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -71,6 +71,3 @@ def retrieve_top_windows(
     # Return paths in original window order (preserves position continuity)
     top_indices_sorted = sorted(top_indices)
     return [delta_dir / f"kv_cache_w{i}.pt" for i in top_indices_sorted]
-
-
-import torch

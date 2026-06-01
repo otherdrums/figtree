@@ -44,7 +44,12 @@ pdga graph show
 - `pdga/delta/` — Delta types, ContextDelta, .pdga format I/O
 - `pdga/db/` — SQLite delta registry and edges
 - `pdga/graph/` — Typed graph edge management
+  - `pdga/graph/edges.py` — Edge CRUD with SQLite
+  - `pdga/graph/dedup.py` — Fact deduplication (exact + semantic)
+  - `pdga/graph/auto_edges.py` — Auto-generate SUPPORTS, CONTRADICTS, PART_OF, SAME_ENTITY edges
+  - `pdga/graph/trust.py` — Trust propagation through graph (alignment boost, contradiction penalty)
 - `pdga/ingest/` — Crystal layer detection + text→ContextDelta pipeline
+  - `pdga/ingest/facts.py` — Atomic fact extraction with absolute position preservation
 - `pdga/kernel/` — Multi-delta attention, generation, multi-stream orchestrator
 - `pdga/retrieval/` — LSH-based boundary residual index
 - `pdga/generation/` — generation generation engine with KV caching and injection
@@ -94,9 +99,35 @@ GPU: Quadro T1000 (3GB VRAM)
   - Cosine similarity selects most relevant delta(s) from a corpus
   - Used in demo to show 2x speedup by loading only 1 of 2 deltas
 
-- **Graph**: Edge management (contradicts, about_same_event)
+- **Atomic Fact Extraction** (`pdga/ingest/facts.py`): Full narrative forward → sentence splitting → per-fact KV slices
+  - Preserves absolute narrative positions in each fact's KV cache
+  - Variable-size facts (4 tokens to 50+ tokens)
+  - Zero-gap attention mask handles missing positions
+  - Backward compatible with legacy full-narrative caches
 
-- **Graph**: Edge management (contradicts, about_same_event)
+- **Graph Deduplication** (`pdga/graph/dedup.py`): Two-step dedup across narratives
+  - Exact text match (normalized) → same canonical fact
+  - Semantic similarity via model embeddings → merge near-duplicates
+  - `get_shared_facts()`: Facts appearing in multiple sources
+  - `get_unique_facts()`: Facts unique to a single narrative
+
+- **Auto Edge Generation** (`pdga/graph/auto_edges.py`): Generate edges from fact relationships
+  - PART_OF: each fact → parent narrative
+  - SUPPORTS: duplicate facts across sources
+  - SAME_ENTITY: facts sharing entities (simple heuristic extraction)
+  - CONTRADICTS: negation-pattern detection
+
+- **Trust Propagation** (`pdga/graph/trust.py`): Source trust flows to facts
+  - Base trust = mean of source narrative trusts
+  - Alignment boost: +0.05 per additional corroborating source
+  - Contradiction penalty: -0.15 × delta if high-trust fact contradicts
+  - `rank_facts()`: Return facts sorted by propagated trust
+
+- **Davos Multi-Perspective Demo** (`examples/run_davos_demo.py`): Three narratives, one event
+  - pro_globalist (Reuters, trust=0.95), anti_globalist (Guardian, trust=0.60), conspiracy (Fringe, trust=0.15)
+  - Per-source generation, cross-source agreement, contradiction detection
+  - Interactive shell (`examples/davos_shell.py`) for querying the knowledge base
+  - Benchmark (`examples/davos_benchmark.py`) measuring end-to-end pipeline
 
 ### Not Working
 
@@ -236,6 +267,15 @@ python3 tests/test_boundary_kv.py
 
 # Full demo with ingestion + generation pipeline
 python3 examples/run_demo.py all
+
+# Davos multi-perspective demo (ingest + generate + graph)
+python3 examples/run_davos_demo.py all
+
+# Interactive shell for querying the knowledge base
+python3 examples/davos_shell.py
+
+# End-to-end benchmark
+python3 examples/davos_benchmark.py
 
 # Multi-delta generation test
 python3 tests/test_generation_comprehensive.py multi

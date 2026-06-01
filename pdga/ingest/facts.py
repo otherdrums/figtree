@@ -13,15 +13,13 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 
 from pdga.delta.cache_io import save_window_cache
-from pdga.delta.base import DeltaManifest, Delta
+from pdga.delta.base import Delta
 
 
 def split_into_sentences(text: str) -> list[str]:

@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Optional
 from transformers.cache_utils import DynamicCache
 
-from pdga.delta.cache_io import load_window_cache
 from pdga.kernel.prompt import build_prompt_ids
 
 

@@ -8,11 +8,10 @@ narrative positions for correct attention computation.
 from __future__ import annotations
 
 import gc
-import json
 import time
 import torch
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 from transformers.cache_utils import DynamicCache
 from pdga.kernel.prompt import build_prompt_ids
 
