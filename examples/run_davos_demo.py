@@ -23,7 +23,7 @@ from rich.table import Table
 from rich.rule import Rule
 from rich.text import Text
 
-from pdga.ingest.text import ingest_text
+from pdga.ingest.facts import ingest_narrative_with_facts
 from pdga.db.store import DeltaDB
 from pdga.delta.cache_io import list_window_caches
 from pdga.generation.streaming import StreamingGenerator
@@ -90,7 +90,7 @@ def do_ingest():
     console.print("  Loaded: {} layers, h={}".format(
         model.config.num_hidden_layers, model.config.hidden_size))
 
-    banner("Ingesting...", "Each narrative's full KV cache computed and stored.")
+    banner("Ingesting...", "Full narrative KV + atomic fact extraction with absolute positions.")
     db = DeltaDB()
 
     for key, text in narratives.items():
@@ -98,29 +98,31 @@ def do_ingest():
         token_count = len(tokenizer.encode(text))
         console.print(f"  {key} ({source['name']}, trust={source['trust']}) — {token_count} tokens...")
         
-        delta = ingest_text(
+        result = ingest_narrative_with_facts(
             model=model, tokenizer=tokenizer, text=text,
-            output_dir=DELTAS_DIR, window_size=500,
-            trust=source["trust"], tags=["davos", key],
+            output_dir=DELTAS_DIR, narrative_id=key, source_id=key,
+            trust=source["trust"], min_fact_tokens=10,
         )
-        delta_dir = delta.path
-        wins = list_window_caches(delta_dir)
-        kv_size = sum((delta_dir / f"kv_cache_w{w}.pt").stat().st_size
-                      for w in wins) / 1024
         
+        narrative_dir = result["narrative_path"]
+        
+        # Register narrative
         db.register(
-            delta_id=delta.delta_id, delta_type="context",
-            path=str(delta_dir),
+            delta_id=result["narrative_id"], delta_type="context",
+            path=str(narrative_dir),
             base_model=model.config._name_or_path or MODEL_ID,
             source_text=text, trust=source["trust"],
-            num_windows=delta.num_windows, tags=["davos", key],
+            num_windows=1, tags=["davos", key],
         )
 
-        pdga_size = sum(f.stat().st_size for f in delta_dir.rglob("*")
+        pdga_size = sum(f.stat().st_size for f in narrative_dir.rglob("*")
                         if f.is_file()) / 1024
-        console.print("    windows={}  kv_caches={}  kv={:.0f}KB  total={:.0f}KB  crystal=L{}".format(
-            delta.num_windows, len(wins), kv_size, pdga_size,
-            delta.manifest.crystal_layer))
+        console.print("    facts={}  total={:.0f}KB".format(
+            result["num_facts"], pdga_size))
+        
+        # Show extracted facts
+        for f in result["facts"]:
+            console.print(f"      fact {f['fact_id']}: pos {f['start_pos']}-{f['end_pos']} ({f['token_count']} tokens)")
 
     db.close()
     console.print("\n[bold green]Ingestion complete.[/bold green] Run: python3 run_davos_demo.py generate")
@@ -146,19 +148,29 @@ def do_generate():
 
     paths = sorted(DELTAS_DIR.glob("*.pdga"))
     
-    # Map paths to narrative keys by reading metadata
+    # Helper: get all fact paths for a narrative
+    def get_fact_paths(narrative_dir):
+        facts_dir = narrative_dir / "facts"
+        if not facts_dir.exists():
+            return []
+        return sorted(facts_dir.glob("*/kv_cache.pt"))
+    
+    # Map paths to narrative keys by reading narrative.json
     import json
     narrative_map = {}
     for path in paths:
-        meta = json.loads((path / "metadata.json").read_text())
-        tags = meta.get("tags", [])
-        for key in SOURCES:
-            if key in tags:
-                narrative_map[key] = path
-                break
+        narrative_json = path / "narrative.json"
+        if narrative_json.exists():
+            meta = json.loads(narrative_json.read_text())
+            source_key = meta.get("source_key", "")
+            for key in SOURCES:
+                if key == source_key:
+                    narrative_map[key] = path
+                    break
 
-    # ── Query 1: Full narrative load per source ──────────────────────────
+    # ── Query 1: Per-Source Generation (load all facts from each narrative) ─
     console.print("\n[bold underline green]── QUERY 1: Per-Source Generation ──[/bold underline green]")
+    console.print("[dim]Loading all facts from each narrative with absolute positions preserved[/dim]")
     
     queries = [
         ("What happened at Davos?", "neutral"),
@@ -172,10 +184,9 @@ def do_generate():
         
         for key, path in narrative_map.items():
             source = SOURCES[key]
-            wins = list_window_caches(path)
-            win_paths = [path / f"kv_cache_w{w}.pt" for w in wins]
+            fact_paths = get_fact_paths(path)
             
-            gen = StreamingGenerator(model, win_paths)
+            gen = StreamingGenerator(model, fact_paths)
             r = gen.generate(
                 tokenizer,
                 prompt=f"Based on the provided context, answer this question: {query_text}",
@@ -184,6 +195,7 @@ def do_generate():
             r["source"] = source["name"]
             r["trust"] = source["trust"]
             r["key"] = key
+            r["num_facts"] = len(fact_paths)
             results.append(r)
             del gen
             gc.collect()
@@ -196,27 +208,27 @@ def do_generate():
         for r in results:
             color = SOURCES[r["key"]]["color"]
             title = Text(f"{r['source']} (trust={r['trust']})", style=color)
-            title.append(f"  {r['num_tokens']} tokens  {r['tokens_per_second']:.1f} t/s", style="dim")
+            title.append(f"  {r['num_tokens']} tokens  {r['tokens_per_second']:.1f} t/s  {r['num_facts']} facts", style="dim")
             console.print(Panel(title, border_style=color))
             console.print(r["generated_text"][:600])
             console.print()
 
     # ── Query 2: Cross-source comparison ────────────────────────────────
     console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? ──[/bold underline yellow]")
+    console.print("[dim]Loading all facts from all narratives combined[/dim]")
     
-    # Load all three and generate
-    all_paths = []
+    # Load all facts from all narratives
+    all_fact_paths = []
     for key, path in narrative_map.items():
-        wins = list_window_caches(path)
-        all_paths.extend([path / f"kv_cache_w{w}.pt" for w in wins])
+        all_fact_paths.extend(get_fact_paths(path))
     
-    gen = StreamingGenerator(model, all_paths)
+    gen = StreamingGenerator(model, all_fact_paths)
     r = gen.generate(
         tokenizer,
         prompt="Based on all the provided sources, what facts do they all agree on? List only points that appear in multiple sources.",
         max_new_tokens=400, sample_temp=0.7,
     )
-    console.print(Panel(f"All sources combined  ({r['num_tokens']} tokens)", border_style="blue"))
+    console.print(Panel(f"All sources combined  ({r['num_tokens']} tokens, {len(all_fact_paths)} facts)", border_style="blue"))
     console.print(r["generated_text"])
     console.print()
     del gen
@@ -226,7 +238,7 @@ def do_generate():
     # ── Query 3: Where do they disagree? ──────────────────────────────────
     console.print("\n[bold underline red]── QUERY 3: Where Do Sources Disagree? ──[/bold underline red]")
     
-    gen = StreamingGenerator(model, all_paths)
+    gen = StreamingGenerator(model, all_fact_paths)
     r = gen.generate(
         tokenizer,
         prompt="Based on all the provided sources, what are the major disagreements or contradictions between the different perspectives?",
