@@ -1,35 +1,65 @@
-# Figtree — grow coherent Images from Figments
+# FigTree — coherent context images from a single primitive
 
-A figment-centric system for ingesting arbitrary text into atomic figments with
-compressed boundary representations and pre-computed per-token KV caches.
-During generation, figments are loaded from cached KV, enabling factual recall
-on constrained GPUs with minimal storage.
+**Everything is a Figment.** There is no database. There is no graph store.
+There is no separate KV cache layer. There is one type — the **Figment** — and
+every operation in the system produces, transforms, or retrieves figments.
 
-## Inspiration
+## What is a Figment?
 
-Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
+A Figment is a **self-contained unit of knowledge** that carries everything
+needed to recall, verify, and relate it within a language model's latent space:
 
-- **Boundary residuals** — LARQL stores one residual vector per text window at
-  the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to
-  ~2.8MB of boundary residuals — 20,000× over full KV cache.
-- **Crystal layer detection** — The model layer where the residual stream
-  stabilizes, enabling early-layer skipping.
-- **"The model IS the database"** — Model weights reorganized as queryable
-  knowledge with patches as lightweight overlays.
-- **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for
-  LSH retrieval, KV cache for generation.
+| Component | Size | Purpose |
+|-----------|------|---------|
+| `text.txt` | ~100 B | Natural language statement — the human-readable payload |
+| `boundary.npy` | ~10 KB | Single hidden-state vector at the **crystal layer**, used for similarity search and deduplication |
+| `boundaries.npy` | ~360 KB | Per-layer hidden states (all layers), used for boundary projection and cross-layer analysis |
+| `kv_cache.npy` | ~2.8 MB | Pre-computed unrotated K/V for every token at every layer — enables generation without a forward pass |
+| `manifest.json` | ~200 B | Metadata: children, sources, trust score, edge type |
 
-Figtree extends these concepts with:
+A Figment is stored as a **`.figment/` directory** on disk — a directory is the
+unit of persistence. This is not a file format; it is a filesystem primitive.
 
-- **One universal primitive** — Everything is a Figment (images, edges, trust,
-  metadata). An Image is a Figment with children.
-- **Pre-computed per-token KV cache** — During ingestion, each figment's
-  unrotated K/V is computed for all layers and stored as `kv_cache.npy`
-  (~2.8 MB per 20-token figment). During generation, RoPE is applied and K/V
-  is inserted directly into the cache — no forward pass needed.
-- **Boundary + KV hybrid storage** — Boundaries (~10 KB) for retrieval and
-  similarity search; KV cache (~2.8 MB per figment) for generation.
-- **Graph as figments** — All relationships and trust are first-class Figments.
+### What can be a Figment?
+
+**An Image** is a Figment with children:
+```python
+image = Figment(text="Davos Summit article", children=[sent1, sent2, ...])
+```
+
+**An Edge** is a Figment with `meta["edge_type"]`:
+```python
+edge = Figment(text="Figment A supports Figment B", meta={"edge_type": "supports"})
+```
+
+**A Trust score** is a Figment with `meta["edge_type"] = "trust"`:
+```python
+trust = Figment(text="Source Reuters has trust 0.95", meta={"edge_type": "trust", "score": 0.95})
+```
+
+**A Graph** is simply a collection of figments — edges, trust assertions, and
+content figments living in the same namespace. There is no separate graph
+database. Relationships are figments that reference other figments.
+
+**The system itself** is represented as figments. A meta-figment describes the
+FigTree installation, its configuration, and its current state.
+
+### The radical idea
+
+Traditional RAG systems have layers of abstraction:
+```
+Documents → chunks → embeddings → vector DB → relational DB → graph DB → cache
+```
+
+FigTree collapses everything into one type:
+```
+Anything → Figment → more Figments
+```
+
+Because figments carry both a **text representation** (for the model to read)
+and a **boundary representation** (for the model to recall), the model can
+reason about its own knowledge structure. A figment about another figment is
+just another figment — recursive, composable, and uniform.
 
 ## Quick Start
 
@@ -205,6 +235,32 @@ python3 examples/davos_benchmark_v2.py
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
    headroom. Works for 300–500 token contexts. For longer context or larger
    models, use Qwen3-2B (~1.5GB) or a 6GB+ GPU.
+
+## Inspiration
+
+Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
+
+- **Boundary residuals** — LARQL stores one residual vector per text window at
+  the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to
+  ~2.8MB of boundary residuals — 20,000× over full KV cache.
+- **Crystal layer detection** — The model layer where the residual stream
+  stabilizes, enabling early-layer skipping.
+- **"The model IS the database"** — Model weights reorganized as queryable
+  knowledge with patches as lightweight overlays.
+- **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for
+  LSH retrieval, KV cache for generation.
+
+Figtree extends these concepts with:
+
+- **One universal primitive** — Everything is a Figment (images, edges, trust,
+  metadata). An Image is a Figment with children.
+- **Pre-computed per-token KV cache** — During ingestion, each figment's
+  unrotated K/V is computed for all layers and stored as `kv_cache.npy`
+  (~2.8 MB per 20-token figment). During generation, RoPE is applied and K/V
+  is inserted directly into the cache — no forward pass needed.
+- **Boundary + KV hybrid storage** — Boundaries (~10 KB) for retrieval and
+  similarity search; KV cache (~2.8 MB per figment) for generation.
+- **Graph as figments** — All relationships and trust are first-class Figments.
 
 ## Credit
 
