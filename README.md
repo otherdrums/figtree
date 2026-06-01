@@ -1,9 +1,9 @@
 # PDGA — Parallel Delta Graph Architecture
 
-A system for ingesting arbitrary text into delta representations that capture
-the model's full KV cache state. During generation, pre-computed KV caches are
-loaded from disk into GPU memory, enabling instant prefill and factual recall
-from article-length context on constrained GPUs.
+A fact-centric system for ingesting arbitrary text into atomic facts with
+compressed boundary representations. During generation, full KV caches are
+regenerated on-the-fly from fact text, enabling factual recall on constrained
+GPUs with minimal storage.
 
 ## Inspiration
 
@@ -14,133 +14,130 @@ Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql)
 - **"The model IS the database"** — Model weights reorganized as queryable knowledge with patches as lightweight overlays.
 - **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for LSH retrieval, KV cache for generation. This is retrieval + generation, not compression.
 
-PDGA extends these concepts with KV cache serialization, progressive GPU loading
-from system RAM, SDPA-based streaming attention, and a delta graph architecture.
+PDGA extends these concepts with:
+- **Fact-centric architecture** — Everything is a Fact (narratives, edges, trust)
+- **On-the-fly KV generation** — No pre-computed KV cache storage; regenerate from text
+- **Custom CUDA kernel** for boundary projection through W_k/W_v
+- **Graph as facts** — All relationships are first-class Facts
 
 ## Quick Start
 
 ```bash
 pip install -e .
 
-# Ingest an article (captures full KV cache to disk)
-pdga ingest article.txt --trust 0.99 --tags summit_event
+# Full Davos demo (ingest + generate + graph)
+python3 examples/run_davos_v2.py all
 
-# List stored deltas
-pdga list-deltas
+# Interactive shell
+python3 examples/davos_shell_v2.py
 
-# Generate with loaded KV cache (instant prefill)
-pdga generate "What happened?" --deltas abc123
-
-# Multi-stream parallel generation
-pdga think "Analyze" --streams "conscious:d=abc123:st=0.5|explore:d=def456:st=0.9"
-
-# Retrieve relevant deltas
-pdga retrieve "trade summit"
-
-# Manage graph edges
-pdga graph link --source abc123 --edge-type contradicts --target def456
-pdga graph show
+# Benchmark
+python3 examples/davos_benchmark_v2.py
 ```
 
 ## Demo
 
 ```bash
-python3 examples/run_demo.py all
+python3 examples/run_davos_v2.py all
 ```
 
-Two conflicting news articles are ingested with full KV cache capture.
-The demo runs the **streaming generator** with progressive KV loading:
+Three conflicting news narratives are ingested with boundary capture only
+(~10 KB per fact). The demo runs on-the-fly KV generation:
 
 ```
-Full article (372 tokens) → KV cache on disk → progressive GPU load → SDPA → 600 tokens generated
-
-Retrieval mode: boundary residuals scored against query → only relevant delta loaded → 2x speedup
+Text → sentence splitting → boundary capture → .pdga directory (~10 KB/fact)
+  ↓
+Query → retrieve facts → tokenize text → forward → KV cache → generate
 ```
 
 **Results** (Qwen3-4B on Quadro T1000, 3GB):
 
-| Article | Tokens | Facts Found | Recall |
-|---------|--------|-------------|--------|
-| Article A (pro-deal) | 372 | 19/20 | 95% |
-| Article B (skeptical) | 366 | 14/14 | 100% |
-| Retrieved A (pro-deal) | 372 | 19/20 | 95% |
-| Retrieved B (skeptical) | 366 | 14/14 | 100% |
-
-**Sovereignty**: Zero cross-contamination. Each article's output contains only
-facts from its own context.
+| Phase | Time | Output |
+|-------|------|--------|
+| Ingestion | 23.4s | 41 facts, 445 KB |
+| Generation | 33.6s | 100 tokens, 35 facts |
+| Graph | 0.0s | 38 facts, 3 edges |
+| **Total** | **57.0s** | |
 
 ## Architecture
 
 ```
 pdga/
-├── delta/         Delta types, ContextDelta, .pdga format I/O
-├── db/            SQLite delta registry and edges
-├── graph/         Typed graph edge management
-├── ingest/        Crystal layer detection, text→ContextDelta pipeline, KV cache capture
-├── kernel/        Per-delta generation (corrected engine with residual routing)
-├── retrieval/     LSH-based boundary residual index
-├── generation/    Streaming generator + boundary-kv engine
-└── cli/           Typer CLI
+├── fact/          # Fact primitive, ingestion, generation, graph
+│   ├── primitive.py    # Fact dataclass — universal primitive
+│   ├── ingest.py       # Text → facts with boundary capture
+│   ├── generate.py     # On-the-fly KV + standard attention
+│   └── graph.py        # Edges/trust as facts + dedup
+└── kernel/        # CUDA kernels
+    ├── boundary_project.cu   # Boundary → K/V projection
+    ├── boundary_project.py   # Python wrapper
+    └── build.py              # Compilation script
 ```
 
-### Delta Format (.pdga)
+### Fact Format (.pdga)
 
 ```
-delta.pdga/
-├── boundaries.npy          Boundary residuals at crystal layer (for LSH retrieval)
-├── window_tokens.npz       Token IDs per window
-├── kv_cache_w0.pt          Full KV cache for window 0 (K/V per layer)
-├── manifest.json           Model config, crystal layer, provenance
-└── metadata.json           Trust, source URL, tags
+fact.pdga/
+├── manifest.json    # fact_id, children, meta, sources, trust
+├── boundary.npy     # (hidden_size,) float32 — ~10 KB
+└── text.txt         # Natural language statement
 ```
 
 ## Model
 
-Default: `unsloth/Qwen3-4B-bnb-4bit` (36 layers, hidden_size=2560, 4-bit quantized)  
+Default: `unsloth/Qwen3-4B-bnb-4bit` (36 layers, hidden_size=2560, 4-bit quantized)
 Tested on: Quadro T1000 (3GB VRAM)
 
 ## How It Works
 
-### 1. Ingestion (`pdga/ingest/text.py`)
+### 1. Ingestion (`pdga/fact/ingest.py`)
 
-Text is split into windows (default 500 tokens, or larger than article length).
-For each window:
-- Manual forward through all 36 layers with `DynamicCache`
-- KV cache saved to `kv_cache_w{N}.pt`
-- Boundary residual captured at crystal layer
+Text is split into sentences. For each sentence:
+- Forward through model layers 0..crystal_layer
+- Capture boundary = hidden state of last token at crystal layer
+- Save as `.pdga`: boundary.npy + text.txt + manifest.json
 
-### 2. Generation (`pdga/generation/streaming.py`)
+### 2. Generation (`pdga/fact/generate.py`)
 
-**Prefill** (instant — no window token re-processing):
-1. Load full KV cache from disk → CPU RAM
-2. For each layer: move window K/V from CPU → GPU, update `DynamicCache`
-3. Forward prompt tokens through layer attending to cached KVs
-4. Explicit causal 4D mask ensures prompt sees all window positions
+**Fact KV generation** (on-the-fly):
+1. For each selected fact, tokenize its text
+2. Forward through all 36 layers with DynamicCache
+3. Fact KV entries populate the cache
 
-**Decode** (autoregressive):
+**Prefill:**
+1. Prompt tokens embed → forward through layers with cached fact K/V
+2. Explicit causal 4D mask ensures prompt sees all fact positions
+3. Final norm → lm_head → logits
+
+**Decode:**
 1. Sample next token
-2. Forward through all layers with cached KVs
+2. Forward through all layers with cached K/V
 3. KV cache grows by 1 position per layer per step
 
-All forward passes wrapped in `torch.no_grad()` — saves ~450 MB GPU by preventing
-4-bit dequantized weight buffers from accumulating in the autograd graph.
+### 3. Custom CUDA Kernel (`pdga/kernel/boundary_project.cu`)
 
-### 3. Boundary-KV Engine (`pdga/generation/boundary_kv.py`)
+**Boundary projection kernel** for non-quantized models:
+```cuda
+boundary_project_bf16_kernel(
+    boundaries,  // (num_facts, hidden_size)
+    W,           // (hidden_size, kv_dim)
+    out,         // (num_facts, kv_dim)
+    ...
+)
+```
 
-Alternative path that loads KV caches directly into `DynamicCache` without
-the progressive layer-by-layer loading. Same causal mask fix and `no_grad`
-optimization. Used for multi-delta sequential processing.
+For 4-bit quantized models, the Python wrapper falls back to PyTorch `matmul`.
 
 ## Critical Technical Details
 
 ### SDPA Causal Mask Fix
 
-When using SDPA with a pre-existing KV cache (window at positions 0..T-1,
-prompt at T..T+P-1), `is_causal=True` is **incorrect** — it assumes Q starts
-at position 0, blocking attention from prompt to window.
+When using SDPA with a pre-existing KV cache (facts at positions 0..T-1,
+prompt at positions T..T+P-1), `is_causal=True` is **incorrect** — it assumes Q starts
+at position 0, blocking attention from prompt to facts.
 
 Fix: explicit 4D mask `(1, 1, P, T+P)` where each prompt token sees all
-window positions plus previous prompt positions.
+fact positions plus previous prompt positions.
 
 ### Memory Fix for 4-bit Models
 
@@ -155,23 +152,25 @@ function keeps dequantized buffers. Wrapping in `torch.no_grad()` saves ~450 MB:
 ## Testing
 
 ```bash
-# Full demo: ingest + generate with fact verification
-python3 examples/run_demo.py all
+# Quick pipeline test
+python3 tests/test_v2_pipeline.py
 
-# Boundary-kv end-to-end test
-python3 tests/test_boundary_kv.py
+# Full demo: ingest + generate + graph
+python3 examples/run_davos_v2.py all
 
-# Comprehensive tests (multi-delta, facts, benchmark)
-python3 tests/test_generation_comprehensive.py multi
-python3 tests/test_generation_comprehensive.py facts
-python3 tests/test_generation_comprehensive.py bench
+# Interactive shell
+python3 examples/davos_shell_v2.py
+
+# Benchmark
+python3 examples/davos_benchmark_v2.py
 ```
 
 ## Known Limitations
 
-1. **Compressed path non-functional**: Boundary residual at position 0 with zero
+1. **Boundary-only generation non-functional**: Boundary residual at position 0 with zero
    RoPE does not produce factual recall through HF attention. Requires custom
-   CUDA kernel or fine-tuned model.
+   CUDA attention kernel or fine-tuned model. The projection kernel is built and
+   ready for this future path.
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
    headroom. Works for 300–500 token articles. For longer context or larger

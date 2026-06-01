@@ -13,7 +13,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from pdga.kernel.build import get_extension
 
 
 _dtype_to_enum = {
@@ -38,8 +37,6 @@ def project_boundaries_to_kv(
         K_facts: (num_facts, num_kv_heads, head_dim)
         V_facts: (num_facts, num_kv_heads, head_dim)
     """
-    ext = get_extension()
-
     if device is None:
         device = boundaries.device
 

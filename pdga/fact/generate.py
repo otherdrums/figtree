@@ -46,7 +46,6 @@ class FactGenerator:
         top_p: float = 0.95,
     ) -> dict:
         device = self.device
-        dtype = self.dtype
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
         final_norm = self.model.model.norm

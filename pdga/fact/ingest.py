@@ -17,7 +17,6 @@ from __future__ import annotations
 import gc
 import re
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import torch
@@ -127,7 +126,6 @@ def ingest_text_to_facts(
     # Ingest each sentence as a fact
     sentence_facts: list[Fact] = []
     per_token_residuals: list[torch.Tensor] = []
-    handles: list = []
 
     def capture_hook(mod, inp, out):
         o = out[0] if isinstance(out, tuple) else out

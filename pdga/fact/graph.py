@@ -13,12 +13,8 @@ Operations:
 
 from __future__ import annotations
 
-import math
-from pathlib import Path
-from typing import Callable
 
 import numpy as np
-import torch
 
 from pdga.fact.primitive import Fact
 
