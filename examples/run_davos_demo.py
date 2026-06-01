@@ -6,6 +6,7 @@ Phase 2 (generate): python3 run_davos_demo.py generate
 """
 
 import gc
+import json
 import os
 import shutil
 import sys
@@ -27,6 +28,7 @@ from pdga.db.store import DeltaDB
 from pdga.generation.streaming import StreamingGenerator
 from pdga.graph.dedup import FactDeduper, make_embed_fn
 from pdga.graph.auto_edges import AutoEdgeGenerator
+from pdga.graph.trust import TrustPropagator
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -165,7 +167,6 @@ def do_generate():
         return sorted(facts_dir.glob("*/kv_cache.pt"))
     
     # Map paths to narrative keys by reading narrative.json
-    import json
     narrative_map = {}
     for path in paths:
         narrative_json = path / "narrative.json"
@@ -356,6 +357,52 @@ def do_graph():
     for row in rows:
         table.add_row(row[0][:14], row[2], row[1][:14], f"{row[3]:.2f}")
     console.print(table)
+
+    # Build narrative_map for trust display
+    narrative_map_graph = {}
+    for path in paths:
+        narrative_json = path / "narrative.json"
+        if narrative_json.exists():
+            meta = json.loads(narrative_json.read_text())
+            source_key = meta.get("source_key", "")
+            for key in SOURCES:
+                if key == source_key:
+                    narrative_map_graph[key] = path
+                    break
+
+    # Trust propagation
+    console.print("\n[bold]Propagating trust scores...[/bold]")
+    trust_prop = TrustPropagator(db)
+    trust_scores = trust_prop.propagate()
+    console.print(f"  Updated trust for {len(trust_scores)} facts")
+
+    # Display top trusted facts
+    top_facts = trust_prop.rank_facts(10)
+    console.print("\n[bold underline green]── Top Trusted Facts ──[/bold underline green]")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Trust", width=8, justify="right")
+    table.add_column("Fact ID", style="dim", width=20)
+    table.add_column("Text")
+    for f in top_facts:
+        text = f.get("source_text", "")[:100]
+        table.add_row(f"{f.get('trust', 0.5):.2f}", f["delta_id"][:16], text)
+    console.print(table)
+
+    # Narrative-level trust
+    console.print("\n[bold underline yellow]── Narrative Trust Scores ──[/bold underline yellow]")
+    for key in SOURCES:
+        if key not in narrative_map_graph:
+            continue
+        path = narrative_map_graph[key]
+        narrative_json = path / "narrative.json"
+        if narrative_json.exists():
+            meta = json.loads(narrative_json.read_text())
+            narr_trust = trust_prop.get_narrative_trust(meta["narrative_id"])
+            original = SOURCES[key]["trust"]
+            delta = narr_trust - original
+            color = "green" if delta > 0 else "red" if delta < 0 else "white"
+            console.print(f"  {SOURCES[key]['name']}: {original:.2f} → {narr_trust:.2f} "
+                         f"([{color}]{delta:+.2f}[/{color}])")
 
     db.close()
     console.print("\n[bold green]✓[/bold green] Graph generation complete")
