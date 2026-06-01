@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PDGA Davos v2 Interactive Shell.
+"""Figtree Davos v2 Interactive Shell.
 
 Usage:
     python3 davos_shell_v2.py
@@ -18,13 +18,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from pdga.fact.primitive import Fact
-from pdga.fact.generate import FactGenerator
-from pdga.fact.graph import FactGraph
+from figtree.figment import Figment
+from figtree.generate import FigmentGenerator
+from figtree.graph import Figtree
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
-DELTAS_DIR = Path(__file__).parent / "davos_deltas_v2"
+FIGMENTS_DIR = Path(__file__).parent / "davos_figments_v2"
 
 SOURCES = {
     "pro_globalist": {"name": "Reuters-style", "trust": 0.95, "color": "green"},
@@ -45,19 +45,19 @@ def load_model():
     return model, tokenizer
 
 
-def load_all_facts() -> list[Fact]:
-    facts = []
+def load_all_figments() -> list[Figment]:
+    figments = []
     for key in SOURCES:
-        fact_dirs = sorted((DELTAS_DIR / key).glob("*.pdga"))
-        for d in fact_dirs:
-            facts.append(Fact.load(d))
-    return facts
+        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
+        for d in figment_dirs:
+            figments.append(Figment.load(d))
+    return figments
 
 
-def retrieve_facts(query: str, facts: list[Fact], limit: int = 10) -> list[Fact]:
+def retrieve_figments(query: str, figments: list[Figment], limit: int = 10) -> list[Figment]:
     query_words = set(query.lower().split())
     scored = []
-    for f in facts:
+    for f in figments:
         if f.is_edge() or f.is_trust_assertion():
             continue
         text_words = set(f.text.lower().split())
@@ -69,20 +69,20 @@ def retrieve_facts(query: str, facts: list[Fact], limit: int = 10) -> list[Fact]
 
 
 def main():
-    if not DELTAS_DIR.exists() or not any(DELTAS_DIR.iterdir()):
-        console.print("[bold red]Error:[/bold red] No ingested deltas found.")
+    if not FIGMENTS_DIR.exists() or not any(FIGMENTS_DIR.iterdir()):
+        console.print("[bold red]Error:[/bold red] No ingested figments found.")
         console.print("Run: python3 run_davos_v2.py ingest")
         sys.exit(1)
 
-    console.print("[bold blue]PDGA Davos v2 Interactive Shell[/bold blue]")
+    console.print("[bold blue]Figtree Davos v2 Interactive Shell[/bold blue]")
     console.print("Loading model...")
     model, tokenizer = load_model()
-    gen = FactGenerator(model, tokenizer)
-    all_facts = load_all_facts()
-    graph = FactGraph(all_facts)
+    gen = FigmentGenerator(model, tokenizer)
+    all_figments = load_all_figments()
+    graph = Figtree(all_figments)
     graph.propagate_trust()
 
-    console.print(f"Ready. {len(all_facts)} facts loaded. Type /help for commands.\n")
+    console.print(f"Ready. {len(all_figments)} figments loaded. Type /help for commands.\n")
 
     while True:
         try:
@@ -95,7 +95,7 @@ def main():
         if query == "/quit":
             break
         elif query == "/help":
-            console.print("Commands: /trust, /sources, /facts <key>, /all, /quit")
+            console.print("Commands: /trust, /sources, /figments <key>, /all, /quit")
             continue
         elif query == "/trust":
             top = graph.get_top_facts(10)
@@ -110,35 +110,35 @@ def main():
             continue
         elif query == "/sources":
             for key in SOURCES:
-                dirs = list((DELTAS_DIR / key).glob("*.pdga"))
-                atomic = [Fact.load(d) for d in dirs if not Fact.load(d).is_narrative() and not Fact.load(d).is_trust_assertion()]
-                console.print(f"  {key}: {len(atomic)} facts")
+                dirs = list((FIGMENTS_DIR / key).glob("*.figment"))
+                atomic = [Figment.load(d) for d in dirs if not Figment.load(d).is_image() and not Figment.load(d).is_trust_assertion()]
+                console.print(f"  {key}: {len(atomic)} figments")
             continue
-        elif query.startswith("/facts "):
+        elif query.startswith("/figments "):
             key = query.split(" ", 1)[1].strip()
             if key not in SOURCES:
                 console.print(f"[red]Unknown: {key}[/red]")
                 continue
-            dirs = sorted((DELTAS_DIR / key).glob("*.pdga"))
+            dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
             for i, d in enumerate(dirs[:5], 1):
-                f = Fact.load(d)
-                if not f.is_narrative() and not f.is_trust_assertion():
+                f = Figment.load(d)
+                if not f.is_image() and not f.is_trust_assertion():
                     console.print(f"  {i}. {f.text[:80]}")
             continue
         elif query == "/all":
-            facts = [f for f in all_facts if not f.is_narrative() and not f.is_trust_assertion()]
-            console.print(f"[dim]Loading all {len(facts)} facts...[/dim]")
+            figments = [f for f in all_figments if not f.is_image() and not f.is_trust_assertion()]
+            console.print(f"[dim]Loading all {len(figments)} figments...[/dim]")
         else:
-            facts = retrieve_facts(query, all_facts)
-            if not facts:
-                console.print("[yellow]No relevant facts.[/yellow]")
+            figments = retrieve_figments(query, all_figments)
+            if not figments:
+                console.print("[yellow]No relevant figments.[/yellow]")
                 continue
-            console.print(f"[dim]Retrieved {len(facts)} facts[/dim]")
+            console.print(f"[dim]Retrieved {len(figments)} figments[/dim]")
 
         gc.collect()
         torch.cuda.empty_cache()
 
-        result = gen.generate(facts, query, max_new_tokens=100)
+        result = gen.generate(figments, query, max_new_tokens=100)
         console.print(Panel(f"Generated ({result['num_tokens']} tokens)", border_style="blue"))
         console.print(result["generated_text"])
         console.print()

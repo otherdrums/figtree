@@ -1,24 +1,35 @@
-# PDGA — Parallel Delta Graph Architecture
+# Figtree — grow coherent Images from Figments
 
-A fact-centric system for ingesting arbitrary text into atomic facts with
-compressed boundary representations. During generation, full KV caches are
-regenerated on-the-fly from fact text, enabling factual recall on constrained
-GPUs with minimal storage.
+A figment-centric system for ingesting arbitrary text into atomic figments with
+compressed boundary representations and pre-computed per-token KV caches.
+During generation, figments are loaded from cached KV, enabling factual recall
+on constrained GPUs with minimal storage.
 
 ## Inspiration
 
 Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
 
-- **Boundary residuals** — LARQL stores one residual vector per text window at the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to ~2.8MB of boundary residuals — 20,000× over full KV cache.
-- **Crystal layer detection** — The model layer where the residual stream stabilizes, enabling early-layer skipping.
-- **"The model IS the database"** — Model weights reorganized as queryable knowledge with patches as lightweight overlays.
-- **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for LSH retrieval, KV cache for generation. This is retrieval + generation, not compression.
+- **Boundary residuals** — LARQL stores one residual vector per text window at
+  the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to
+  ~2.8MB of boundary residuals — 20,000× over full KV cache.
+- **Crystal layer detection** — The model layer where the residual stream
+  stabilizes, enabling early-layer skipping.
+- **"The model IS the database"** — Model weights reorganized as queryable
+  knowledge with patches as lightweight overlays.
+- **Boundary-KV engine** — LARQL's boundary retrieval store: boundaries for
+  LSH retrieval, KV cache for generation.
 
-PDGA extends these concepts with:
-- **Fact-centric architecture** — Everything is a Fact (narratives, edges, trust)
-- **On-the-fly KV generation** — No pre-computed KV cache storage; regenerate from text
-- **Custom CUDA kernel** for boundary projection through W_k/W_v
-- **Graph as facts** — All relationships are first-class Facts
+Figtree extends these concepts with:
+
+- **One universal primitive** — Everything is a Figment (images, edges, trust,
+  metadata). An Image is a Figment with children.
+- **Pre-computed per-token KV cache** — During ingestion, each figment's
+  unrotated K/V is computed for all layers and stored as `kv_cache.npy`
+  (~2.8 MB per 20-token figment). During generation, RoPE is applied and K/V
+  is inserted directly into the cache — no forward pass needed.
+- **Boundary + KV hybrid storage** — Boundaries (~10 KB) for retrieval and
+  similarity search; KV cache (~2.8 MB per figment) for generation.
+- **Graph as figments** — All relationships and trust are first-class Figments.
 
 ## Quick Start
 
@@ -41,46 +52,48 @@ python3 examples/davos_benchmark_v2.py
 python3 examples/run_davos_v2.py all
 ```
 
-Three conflicting news narratives are ingested with boundary capture only
-(~10 KB per fact). The demo runs on-the-fly KV generation:
+Three conflicting news narratives are ingested with boundary + KV capture
+(~10 KB boundary + ~2.8 MB KV per figment). Generation uses cached K/V:
 
 ```
-Text → sentence splitting → boundary capture → .pdga directory (~10 KB/fact)
+Text → sentence splitting → boundary + KV capture → .figment directory
   ↓
-Query → retrieve facts → tokenize text → forward → KV cache → generate
+Query → retrieve figments → load KV cache → apply RoPE → generate
 ```
 
 **Results** (Qwen3-4B on Quadro T1000, 3GB):
 
 | Phase | Time | Output |
 |-------|------|--------|
-| Ingestion | 23.4s | 41 facts, 445 KB |
-| Generation | 33.6s | 100 tokens, 35 facts |
-| Graph | 0.0s | 38 facts, 3 edges |
+| Ingestion | 23.4s | 41 figments, 445 KB |
+| Generation | 33.6s | 100 tokens, 35 figments |
+| Graph | 0.0s | 38 figments, 3 edges |
 | **Total** | **57.0s** | |
 
 ## Architecture
 
 ```
-pdga/
-├── fact/          # Fact primitive, ingestion, generation, graph
-│   ├── primitive.py    # Fact dataclass — universal primitive
-│   ├── ingest.py       # Text → facts with boundary capture
-│   ├── generate.py     # On-the-fly KV + standard attention
-│   └── graph.py        # Edges/trust as facts + dedup
-└── kernel/        # CUDA kernels
-    ├── boundary_project.cu   # Boundary → K/V projection
-    ├── boundary_project.py   # Python wrapper
-    └── build.py              # Compilation script
+figtree/
+├── figment.py       # Figment dataclass — universal primitive + save/load
+├── ingest.py        # Text → figments with boundary + kv_cache capture
+├── generate.py      # Text-based and boundary-based generation
+├── graph.py         # Edges/trust as figments + dedup
+└── kernel/          # CUDA kernels
+    ├── boundary_project.cu    # Boundary → K/V projection (CUDA)
+    ├── boundary_project.py    # Python wrapper
+    └── build.py               # Compilation script
 ```
 
-### Fact Format (.pdga)
+### Figment Format (.figment)
 
 ```
-fact.pdga/
-├── manifest.json    # fact_id, children, meta, sources, trust
-├── boundary.npy     # (hidden_size,) float32 — ~10 KB
-└── text.txt         # Natural language statement
+figment.figment/
+├── manifest.json     # figment_id, children, meta, sources, trust, edge_type
+├── boundary.npy      # (hidden_size,) float32 — ~10 KB
+├── boundary_emb.npy  # (hidden_size,) float32 — last-token embedding
+├── boundaries.npy    # (num_layers, hidden_size) float32 — per-layer states
+├── kv_cache.npy      # (num_layers, seq_len, 2, kv_dim) float32 — ~2.8 MB
+└── text.txt          # Natural language statement
 ```
 
 ## Model
@@ -90,54 +103,66 @@ Tested on: Quadro T1000 (3GB VRAM)
 
 ## How It Works
 
-### 1. Ingestion (`pdga/fact/ingest.py`)
+### 1. Ingestion (`figtree/ingest.py`)
 
 Text is split into sentences. For each sentence:
-- Forward through model layers 0..crystal_layer
-- Capture boundary = hidden state of last token at crystal layer
-- Save as `.pdga`: boundary.npy + text.txt + manifest.json
 
-### 2. Generation (`pdga/fact/generate.py`)
+1. Forward through model layers 0..crystal_layer
+2. Capture boundary = hidden state of last token at crystal layer
+3. For each layer, capture input hidden state, apply `input_layernorm`,
+   project through `k_proj`/`v_proj` with `k_norm`, store unrotated K/V
+4. Save as `.figment`: boundary.npy + text.txt + manifest.json + kv_cache.npy
 
-**Fact KV generation** (on-the-fly):
-1. For each selected fact, tokenize its text
+### 2. Generation (`figtree/generate.py`)
+
+**Text-based** (forward pass for each figment):
+
+1. For each selected figment, tokenize its text
 2. Forward through all 36 layers with DynamicCache
-3. Fact KV entries populate the cache
+3. Figment KV entries populate the cache
+
+**Boundary-based** (load cached K/V from disk, ~22% faster):
+
+1. Load `kv_cache.npy` for each figment
+2. Apply RoPE based on global position IDs
+3. Insert into DynamicCache directly — no forward pass
 
 **Prefill:**
-1. Prompt tokens embed → forward through layers with cached fact K/V
-2. Explicit causal 4D mask ensures prompt sees all fact positions
+
+1. Prompt tokens embed → forward through layers with cached K/V
+2. Explicit causal 4D mask ensures prompt sees all figment positions
 3. Final norm → lm_head → logits
 
 **Decode:**
+
 1. Sample next token
 2. Forward through all layers with cached K/V
 3. KV cache grows by 1 position per layer per step
 
-### 3. Custom CUDA Kernel (`pdga/kernel/boundary_project.cu`)
+### 3. Boundary Projection (`figtree/kernel/boundary_project.cu`)
 
-**Boundary projection kernel** for non-quantized models:
+Custom CUDA kernel for non-quantized models:
 ```cuda
 boundary_project_bf16_kernel(
-    boundaries,  // (num_facts, hidden_size)
+    boundaries,  // (num_figments, hidden_size)
     W,           // (hidden_size, kv_dim)
-    out,         // (num_facts, kv_dim)
+    out,         // (num_figments, kv_dim)
     ...
 )
 ```
 
-For 4-bit quantized models, the Python wrapper falls back to PyTorch `matmul`.
+For 4-bit quantized models, falls back to PyTorch `matmul`.
 
 ## Critical Technical Details
 
 ### SDPA Causal Mask Fix
 
-When using SDPA with a pre-existing KV cache (facts at positions 0..T-1,
-prompt at positions T..T+P-1), `is_causal=True` is **incorrect** — it assumes Q starts
-at position 0, blocking attention from prompt to facts.
+When using SDPA with a pre-existing KV cache (figments at positions 0..T-1,
+prompt at positions T..T+P-1), `is_causal=True` is **incorrect** — it assumes
+Q starts at position 0, blocking attention from prompt to figments.
 
 Fix: explicit 4D mask `(1, 1, P, T+P)` where each prompt token sees all
-fact positions plus previous prompt positions.
+figment positions plus previous prompt positions.
 
 ### Memory Fix for 4-bit Models
 
@@ -148,6 +173,13 @@ function keeps dequantized buffers. Wrapping in `torch.no_grad()` saves ~450 MB:
 |---|---|---|
 | Prefill peak | ~3,036 MB | ~2,583 MB |
 | Decode | OOMs | Stable at ~2,600 MB |
+
+### Pre-norm for KV Projection
+
+During ingestion, the input to each layer is `input_layernorm`'d before
+projecting through `k_proj`/`v_proj`, and `k_norm` is applied. This matches
+the model's internal computation exactly. The K/V is stored unrotated — RoPE
+is applied lazily during generation based on global position IDs.
 
 ## Testing
 
@@ -167,13 +199,11 @@ python3 examples/davos_benchmark_v2.py
 
 ## Known Limitations
 
-1. **Boundary-only generation non-functional**: Boundary residual at position 0 with zero
-   RoPE does not produce factual recall through HF attention. Requires custom
-   CUDA attention kernel or fine-tuned model. The projection kernel is built and
-   ready for this future path.
+1. **kv_cache.npy storage**: ~2.8 MB per 20-token figment. 100 figments = ~280 MB.
+   Manageable on modern drives but not as compact as boundary-only storage.
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
-   headroom. Works for 300–500 token articles. For longer context or larger
+   headroom. Works for 300–500 token contexts. For longer context or larger
    models, use Qwen3-2B (~1.5GB) or a 6GB+ GPU.
 
 ## Credit

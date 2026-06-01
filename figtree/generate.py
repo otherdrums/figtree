@@ -1,8 +1,8 @@
-"""Generation engine v2: on-the-fly KV cache generation from fact text.
+"""Generation engine: on-the-fly KV cache generation from figment text.
 
 Pragmatic approach:
-1. Facts store boundaries (for retrieval/dedup) + text (for KV generation)
-2. During generation, selected facts have their text run through the model
+1. Figments store boundaries (for retrieval/dedup) + text (for KV generation)
+2. During generation, selected figments have their text run through the model
 3. Full KV caches are generated on-the-fly and used in standard attention
 4. After generation, KV caches are freed (ephemeral)
 """
@@ -18,11 +18,11 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 
-from pdga.fact.primitive import Fact
+from figtree.figment import Figment
 
 
-class FactGenerator:
-    """Generate from facts by generating KV caches on-the-fly."""
+class FigmentGenerator:
+    """Generate from figments by generating KV caches on-the-fly."""
 
     def __init__(
         self,
@@ -40,7 +40,7 @@ class FactGenerator:
 
     def generate(
         self,
-        facts: list[Fact],
+        figments: list[Figment],
         prompt: str,
         max_new_tokens: int = 100,
         temperature: float = 0.7,
@@ -53,50 +53,47 @@ class FactGenerator:
         final_norm = self.model.model.norm
         rotary = self.model.model.rotary_emb
 
-        num_facts = len(facts)
+        num_figments = len(figments)
 
-        # Tokenize prompt
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         P = len(prompt_ids)
 
         t0 = time.perf_counter()
 
         with torch.no_grad():
-            # ── Build combined KV cache from all facts (causal chain) ──
             cache = DynamicCache()
 
-            all_fact_ids = []
-            for fact in facts:
-                fid = self.tokenizer.encode(fact.text, add_special_tokens=False)
+            all_figment_ids = []
+            for figment in figments:
+                fid = self.tokenizer.encode(figment.text, add_special_tokens=False)
                 if fid:
-                    all_fact_ids.extend(fid)
+                    all_figment_ids.extend(fid)
 
-            total_fact_len = len(all_fact_ids)
+            total_figment_len = len(all_figment_ids)
 
-            if total_fact_len > 0:
-                fact_pos_ids = torch.arange(total_fact_len, device=device, dtype=torch.long).unsqueeze(0)
+            if total_figment_len > 0:
+                figment_pos_ids = torch.arange(total_figment_len, device=device, dtype=torch.long).unsqueeze(0)
 
-                fact_mask = torch.full(
-                    (1, 1, total_fact_len, total_fact_len),
+                figment_mask = torch.full(
+                    (1, 1, total_figment_len, total_figment_len),
                     float('-inf'), device=device, dtype=torch.float32,
                 )
-                for i in range(total_fact_len):
-                    fact_mask[:, :, i, :i + 1] = 0.0
+                for i in range(total_figment_len):
+                    figment_mask[:, :, i, :i + 1] = 0.0
 
-                h = embed(torch.tensor([all_fact_ids], dtype=torch.long, device=device))
-                pe_facts = rotary(h, fact_pos_ids)
+                h = embed(torch.tensor([all_figment_ids], dtype=torch.long, device=device))
+                pe_figments = rotary(h, figment_pos_ids)
                 for li in range(self.num_layers):
                     layer = self.model.model.layers[li]
                     h = layer(
-                        h, attention_mask=fact_mask, position_ids=fact_pos_ids,
-                        position_embeddings=pe_facts, use_cache=True,
+                        h, attention_mask=figment_mask, position_ids=figment_pos_ids,
+                        position_embeddings=pe_figments, use_cache=True,
                         past_key_values=cache,
                     )
 
-            prompt_offset = total_fact_len
+            prompt_offset = total_figment_len
             total_len = prompt_offset + P
 
-            # ── Prefill prompt with cached fact K/V ──
             prompt_emb = embed(torch.tensor([prompt_ids], dtype=torch.long, device=device))
             prompt_pos_ids = torch.arange(prompt_offset, prompt_offset + P,
                                           device=device, dtype=torch.long).unsqueeze(0)
@@ -119,7 +116,6 @@ class FactGenerator:
             h = final_norm(h)
             logits = lm_head(h[:, -1:, :])
 
-        # ── Decode ──
         gen_ids = list(prompt_ids)
         for step in range(max_new_tokens):
             with torch.no_grad():
@@ -161,29 +157,25 @@ class FactGenerator:
             "num_tokens": ntok,
             "tokens_per_second": ntok / elapsed if elapsed > 0 else 0.0,
             "elapsed": elapsed,
-            "num_facts": num_facts,
+            "num_figments": num_figments,
         }
 
 
     def generate_from_boundaries(
         self,
-        facts: list[Fact],
+        figments: list[Figment],
         prompt: str,
         max_new_tokens: int = 100,
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
-        cache_dir: str = "./facts",
+        cache_dir: str = "./figments",
     ) -> dict:
         """Generate using per-token cached K/V from disk.
 
-        Each fact stores pre-computed unrotated K/V for every token at every
+        Each figment stores pre-computed unrotated K/V for every token at every
         layer (computed during ingestion). This loads the cached K/V, applies
-        RoPE based on global positions, and populates the cache directly —
-        no forward pass through the model for fact processing.
-
-        Falls back to a clear error if facts lack cached K/V (re-ingest or
-        use generate() instead).
+        RoPE based on global positions, and populates the cache directly.
         """
         device = self.device
         embed = self.model.get_input_embeddings()
@@ -196,26 +188,20 @@ class FactGenerator:
         num_kv_heads = config.num_key_value_heads
         head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
 
-        # Load cached K/V for each fact
         all_k: list[torch.Tensor] = []
         all_v: list[torch.Tensor] = []
-        for f in facts:
-            fdir = cache_root / f"{f.fact_id}.pdga"
+        for fig in figments:
+            fdir = cache_root / f"{fig.figment_id}.figment"
             kv_path = fdir / "kv_cache.npy"
             if not kv_path.exists():
-                # Search recursively for the fact directory
-                matches = list(cache_root.rglob(f"{f.fact_id}.pdga/kv_cache.npy"))
-                if matches:
-                    kv_path = matches[0]
-                else:
-                    raise FileNotFoundError(
-                        f"No kv_cache.npy for fact {f.fact_id[:12]}... "
-                        f"Re-ingest the text or use generate() instead."
-                    )
-            kv = np.load(str(kv_path))  # (num_layers, seq_len, 2, kv_dim)
+                raise FileNotFoundError(
+                    f"No kv_cache.npy for figment {fig.figment_id[:12]}... "
+                    f"Re-ingest the text or use generate() instead."
+                )
+            kv = np.load(str(kv_path))
             kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-            all_k.append(kv_t[:, :, 0, :])  # (num_layers, seq_len, kv_dim)
-            all_v.append(kv_t[:, :, 1, :])  # (num_layers, seq_len, kv_dim)
+            all_k.append(kv_t[:, :, 0, :])
+            all_v.append(kv_t[:, :, 1, :])
 
         total_tokens = sum(k.shape[1] for k in all_k)
 
@@ -225,18 +211,16 @@ class FactGenerator:
         t0 = time.perf_counter()
 
         with torch.no_grad():
-            # ── RoPE for all fact token positions ──
             pos_ids = torch.arange(total_tokens, device=device).unsqueeze(0)
             dummy = torch.zeros(1, total_tokens, self.hidden_size, device=device, dtype=self.dtype)
             cos, sin = rotary(dummy, pos_ids)
 
-            # ── Populate KV cache ──
             cache = DynamicCache()
             for li in range(self.num_layers):
-                k = torch.cat([kl[li] for kl in all_k], dim=0)  # (total_tokens, kv_dim)
-                v = torch.cat([vl[li] for vl in all_v], dim=0)  # (total_tokens, kv_dim)
+                k = torch.cat([kl[li] for kl in all_k], dim=0)
+                v = torch.cat([vl[li] for vl in all_v], dim=0)
 
-                k = k.unsqueeze(0)  # (1, total_tokens, kv_dim)
+                k = k.unsqueeze(0)
                 v = v.unsqueeze(0)
 
                 k = k.view(1, total_tokens, num_kv_heads, head_dim).transpose(1, 2)
@@ -248,7 +232,6 @@ class FactGenerator:
             prompt_offset = total_tokens
             total_len = prompt_offset + P
 
-            # ── Prefill prompt ──
             prompt_emb = embed(torch.tensor([prompt_ids], dtype=torch.long, device=device))
             prompt_pos_ids = torch.arange(prompt_offset, prompt_offset + P,
                                           device=device, dtype=torch.long).unsqueeze(0)
@@ -271,7 +254,6 @@ class FactGenerator:
             h = final_norm(h)
             logits = lm_head(h[:, -1:, :])
 
-        # ── Decode ──
         gen_ids = list(prompt_ids)
         for step in range(max_new_tokens):
             with torch.no_grad():
@@ -313,11 +295,9 @@ class FactGenerator:
             "num_tokens": ntok,
             "tokens_per_second": ntok / elapsed if elapsed > 0 else 0.0,
             "elapsed": elapsed,
-            "num_facts": len(facts),
+            "num_figments": len(figments),
             "num_tokens_total": total_tokens,
         }
-
-    # ────────────────────────────────────────────────
 
 
 def _rotate_half(x):

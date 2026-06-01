@@ -11,23 +11,22 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from pdga.fact.ingest import ingest_text_to_facts
-from pdga.fact.generate import FactGenerator
-from pdga.fact.graph import FactGraph
+from figtree.ingest import ingest_text_to_figments
+from figtree.generate import FigmentGenerator
+from figtree.graph import Figtree
 
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
-DELTAS_DIR = Path.home() / ".pdga" / "v2_test"
+FIGMENTS_DIR = Path.home() / ".figtree" / "v2_test"
 
-# Sample narrative
 TEXT = """The World Economic Forum summit in Davos concluded yesterday.
 Leaders from 130 countries gathered alongside 2,700 delegates.
 The centerpiece achievement was the Digital Cooperation Compact."""
 
 
 def main():
-    if DELTAS_DIR.exists():
-        shutil.rmtree(DELTAS_DIR)
-    DELTAS_DIR.mkdir(parents=True, exist_ok=True)
+    if FIGMENTS_DIR.exists():
+        shutil.rmtree(FIGMENTS_DIR)
+    FIGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Loading model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,23 +39,23 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     # Ingest
-    print("\nIngesting text into facts...")
-    facts = ingest_text_to_facts(
+    print("\nIngesting text into figments...")
+    figments = ingest_text_to_figments(
         model=model, tokenizer=tokenizer, text=TEXT,
-        output_dir=DELTAS_DIR, source_id="test_source", trust=0.95,
+        output_dir=FIGMENTS_DIR, source_id="test_source", trust=0.95,
     )
-    print(f"Created {len(facts)} facts:")
-    for f in facts:
+    print(f"Created {len(figments)} figments:")
+    for f in figments:
         print(f"  {f}")
 
-    # Load atomic facts (skip narrative and trust assertion)
-    atomic_facts = [f for f in facts if not f.is_narrative() and not f.is_trust_assertion()]
+    # Load atomic figments (skip image and trust assertion)
+    atomic_figments = [f for f in figments if not f.is_image() and not f.is_trust_assertion()]
 
     # Generate
-    print(f"\nGenerating with {len(atomic_facts)} facts...")
-    gen = FactGenerator(model, tokenizer)
+    print(f"\nGenerating with {len(atomic_figments)} figments...")
+    gen = FigmentGenerator(model, tokenizer)
     result = gen.generate(
-        facts=atomic_facts,
+        figments=atomic_figments,
         prompt="What happened at Davos?",
         max_new_tokens=80,
     )
@@ -65,7 +64,7 @@ def main():
 
     # Graph
     print("\nBuilding graph...")
-    graph = FactGraph(facts)
+    graph = Figtree(figments)
     dedup_edges = graph.deduplicate()
     auto_edges = graph.create_edges()
     trust_scores = graph.propagate_trust()
@@ -77,7 +76,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print("\nv2 pipeline test complete!")
+    print("\nFigtree v2 pipeline test complete!")
 
 
 if __name__ == "__main__":

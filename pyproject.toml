@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pdga"
-version = "0.1.0"
-description = "Parallel Delta Graph Architecture — context-aware multi-delta generation"
+name = "figtree"
+version = "0.2.0"
+description = "Figtree — grow coherent Images from Figments"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
@@ -22,8 +22,5 @@ dev = [
     "networkx>=3.0",
 ]
 
-[project.scripts]
-pdga = "pdga.cli.main:app"
-
 [tool.setuptools.packages.find]
-include = ["pdga*"]
+include = ["figtree*"]

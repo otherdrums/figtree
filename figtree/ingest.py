@@ -1,15 +1,14 @@
-"""Ingestion pipeline v2: text → atomic facts with boundary capture.
-
-No pre-computed KV cache. Only boundaries are stored (~10 KB each).
+"""Ingestion pipeline: text → atomic figments with boundary + kv_cache capture.
 
 Pipeline:
 1. Split text into sentences
 2. For each sentence:
    a. Forward through model layers 0..crystal_layer
    b. Capture boundary = hidden state of LAST token at crystal_layer
-   c. Create Fact
-3. Create narrative Fact with children = sentence facts
-4. Optionally create TrustFact
+   c. Compute per-token per-layer K/V (unrotated)
+   d. Create Figment
+3. Create Image Figment with children = sentence figments
+4. Optionally create TrustFigment
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
-from pdga.fact.primitive import Fact
+from figtree.figment import Figment
 
 
 def split_into_sentences(text: str, min_chars: int = 20) -> list[str]:
@@ -80,7 +79,6 @@ def detect_crystal_layer(
         for h in handles:
             h.remove()
 
-    # Compute L2 differences between consecutive layers
     diffs = []
     for i in range(1, len(residuals)):
         prev = residuals[i - 1][1]
@@ -93,12 +91,12 @@ def detect_crystal_layer(
 
     for i, d in enumerate(diffs):
         if d < threshold:
-            return i + 1  # layer index where stabilization begins
+            return i + 1
 
     return max(1, len(model.model.layers) // 2)
 
 
-def ingest_text_to_facts(
+def ingest_text_to_figments(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     text: str,
@@ -107,10 +105,10 @@ def ingest_text_to_facts(
     trust: float = 0.5,
     crystal_layer: int | None = None,
     min_chars: int = 20,
-) -> list[Fact]:
-    """Ingest text into atomic facts with boundary capture.
+) -> list[Figment]:
+    """Ingest text into atomic figments with boundary + kv_cache capture.
 
-    Returns list of Facts: [narrative, sentence_1, sentence_2, ...]
+    Returns list of Figments: [image, sentence_1, sentence_2, ..., trust_assertion]
     """
     device = model.device
     output_dir = Path(output_dir)
@@ -123,8 +121,7 @@ def ingest_text_to_facts(
     if not sentences:
         raise ValueError("Text produced zero sentences")
 
-    # Ingest each sentence as a fact
-    sentence_facts: list[Fact] = []
+    sentence_figments: list[Figment] = []
     num_layers = len(model.model.layers)
     config = model.config
     num_kv_heads = config.num_key_value_heads
@@ -137,7 +134,6 @@ def ingest_text_to_facts(
             storage[layer_idx] = o.detach()
         return hook
 
-    # Register hooks on all layers
     layer_outputs: dict[int, torch.Tensor] = {}
     handles = []
     for li in range(num_layers):
@@ -150,49 +146,42 @@ def ingest_text_to_facts(
                 if ids.shape[1] == 0:
                     continue
 
-                # Capture embedding output for all tokens
-                emb_out = model.get_input_embeddings()(ids)  # (1, seq_len, hidden_size)
+                emb_out = model.get_input_embeddings()(ids)
                 boundary_emb = emb_out[0, -1, :].float().cpu()
 
-                model(ids)  # forward through all layers, hooks capture all outputs
+                model(ids)
 
                 if len(layer_outputs) != num_layers:
                     raise RuntimeError(f"Expected {num_layers} layer outputs, got {len(layer_outputs)}")
 
-                # Build per-layer boundaries: (num_layers, hidden_size)
                 boundaries_list = [
                     layer_outputs[li][0, -1, :].float().cpu()
                     for li in range(num_layers)
                 ]
                 boundaries_arr = torch.stack(boundaries_list).numpy()
+                boundary_crystal = boundaries_arr[crystal_layer]
 
-                boundary_crystal = boundaries_arr[crystal_layer]  # for backward compat
-
-                # ── Compute per-token per-layer K/V cache (unrotated) ──
                 seq_len = ids.shape[1]
                 kv_cache_list = []
                 for li in range(num_layers):
                     if li == 0:
-                        h_in = emb_out[0]  # (seq_len, hidden_size)
+                        h_in = emb_out[0]
                     else:
-                        h_in = layer_outputs[li - 1][0]  # (seq_len, hidden_size)
+                        h_in = layer_outputs[li - 1][0]
                     layer = model.model.layers[li]
-                    # Apply input_layernorm (pre-norm) before projection,
-                    # matching what the layer's forward pass does internally
                     h_normed = layer.input_layernorm(h_in)
-                    k_unrot = layer.self_attn.k_proj(h_normed)  # (seq_len, kv_dim)
-                    v = layer.self_attn.v_proj(h_normed)  # (seq_len, kv_dim)
-                    # Handle k_norm (QK-norm after projection)
+                    k_unrot = layer.self_attn.k_proj(h_normed)
+                    v = layer.self_attn.v_proj(h_normed)
                     k_normed = k_unrot.view(1, seq_len, num_kv_heads, head_dim).transpose(1, 2)
                     if hasattr(layer.self_attn, "k_norm"):
                         k_normed = layer.self_attn.k_norm(k_normed)
                     k_unrot = k_normed.transpose(1, 2).reshape(seq_len, kv_dim)
                     v = v.reshape(seq_len, kv_dim)
-                    kv_cache_list.append(torch.stack([k_unrot, v], dim=1))  # (seq_len, 2, kv_dim)
+                    kv_cache_list.append(torch.stack([k_unrot, v], dim=1))
 
-                kv_cache_t = torch.stack(kv_cache_list).float().cpu().numpy()  # (num_layers, seq_len, 2, kv_dim)
+                kv_cache_t = torch.stack(kv_cache_list).float().cpu().numpy()
 
-                fact = Fact.create(
+                figment = Figment.create(
                     text=sent,
                     boundary=boundary_crystal,
                     boundaries=boundaries_arr,
@@ -200,11 +189,10 @@ def ingest_text_to_facts(
                     meta={"source_id": source_id, "crystal_layer": crystal_layer},
                     trust=trust,
                 )
-                sentence_facts.append(fact)
+                sentence_figments.append(figment)
 
-                # Save fact + kv_cache immediately
-                fact_dir = fact.save(output_dir)
-                np.save(fact_dir / "kv_cache.npy", kv_cache_t)
+                figment_dir = figment.save(output_dir)
+                np.save(figment_dir / "kv_cache.npy", kv_cache_t)
 
                 layer_outputs.clear()
 
@@ -216,26 +204,23 @@ def ingest_text_to_facts(
         for h in handles:
             h.remove()
 
-    # Create narrative fact
-    narrative = Fact.create(
+    image = Figment.create(
         text=text,
-        boundary=sentence_facts[0].boundary.copy() if sentence_facts else np.zeros(1),
-        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_narrative": True},
-        children=[f.fact_id for f in sentence_facts],
+        boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
+        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True},
+        children=[f.figment_id for f in sentence_figments],
         trust=trust,
     )
 
-    # Create trust assertion fact
-    trust_fact = Fact.create(
+    trust_figment = Figment.create(
         text=f"Source {source_id} has trust {trust:.2f}",
-        boundary=sentence_facts[0].boundary.copy() if sentence_facts else np.zeros(1),
-        meta={"edge_type": "trust", "about_fact": narrative.fact_id, "score": trust},
-        sources=[narrative.fact_id],
+        boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
+        meta={"edge_type": "trust", "about_figment": image.figment_id, "score": trust},
+        sources=[image.figment_id],
     )
 
-    # Save narrative and trust (sentence facts already saved above with kv_cache)
-    narrative.save(output_dir)
-    trust_fact.save(output_dir)
+    image.save(output_dir)
+    trust_figment.save(output_dir)
 
-    all_facts = [narrative] + sentence_facts + [trust_fact]
-    return all_facts
+    all_figments = [image] + sentence_figments + [trust_figment]
+    return all_figments

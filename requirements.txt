@@ -1,4 +1,4 @@
-# PDGA v2 — Fact-Centric Architecture
+# Figtree v2 — Figment-based Architecture
 # Tested on: Python 3.12, CUDA 13.0, Quadro T1000
 # Install: pip install -r requirements.txt
 

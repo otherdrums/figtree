@@ -7,7 +7,7 @@ dist/
 build/
 .ruff_cache/
 .pytest_cache/
-*.pdga/
+*.figment/
 deltas/
 !temp_deltas/
 *.gguf

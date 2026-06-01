@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PDGA Davos v2 Benchmark."""
+"""Figtree Davos v2 Benchmark."""
 
 import os
 import shutil
@@ -13,14 +13,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from rich.console import Console
 from rich.table import Table
 
-from pdga.fact.ingest import ingest_text_to_facts
-from pdga.fact.generate import FactGenerator
-from pdga.fact.graph import FactGraph
-from pdga.fact.primitive import Fact
+from figtree.ingest import ingest_text_to_figments
+from figtree.generate import FigmentGenerator
+from figtree.graph import Figtree
+from figtree.figment import Figment
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
-DELTAS_DIR = Path(__file__).parent / "davos_deltas_v2"
+FIGMENTS_DIR = Path(__file__).parent / "davos_figments_v2"
 NARRATIVES_DIR = Path(__file__).parent / "davos_narratives"
 
 SOURCES = {
@@ -33,11 +33,10 @@ SOURCES = {
 def benchmark():
     results = {}
 
-    if DELTAS_DIR.exists():
-        shutil.rmtree(DELTAS_DIR)
-    DELTAS_DIR.mkdir(parents=True, exist_ok=True)
+    if FIGMENTS_DIR.exists():
+        shutil.rmtree(FIGMENTS_DIR)
+    FIGMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load model
     console.print("[bold]Loading model...[/bold]")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(
@@ -48,44 +47,42 @@ def benchmark():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Phase 1: Ingestion
     console.print("\n[bold]Phase 1: Ingestion[/bold]")
     t0 = time.perf_counter()
-    total_facts = 0
+    total_figments = 0
     total_size = 0
     for key in SOURCES:
         text = (NARRATIVES_DIR / f"{key}.txt").read_text().strip()
-        facts = ingest_text_to_facts(
+        figments = ingest_text_to_figments(
             model=model, tokenizer=tokenizer, text=text,
-            output_dir=DELTAS_DIR / key, source_id=key,
+            output_dir=FIGMENTS_DIR / key, source_id=key,
             trust=SOURCES[key]["trust"], min_chars=20,
         )
-        total_facts += len(facts)
-        size = sum(f.stat().st_size for f in (DELTAS_DIR / key).rglob("*") if f.is_file())
+        total_figments += len(figments)
+        size = sum(f.stat().st_size for f in (FIGMENTS_DIR / key).rglob("*") if f.is_file())
         total_size += size
 
     ingest_time = time.perf_counter() - t0
     results["ingest"] = {
         "time": ingest_time,
-        "facts": total_facts,
+        "figments": total_figments,
         "size_kb": total_size / 1024,
     }
-    console.print(f"  {total_facts} facts in {ingest_time:.1f}s, {total_size/1024:.1f} KB")
+    console.print(f"  {total_figments} figments in {ingest_time:.1f}s, {total_size/1024:.1f} KB")
 
-    # Phase 2: Generation
     console.print("\n[bold]Phase 2: Generation[/bold]")
-    gen = FactGenerator(model, tokenizer)
+    gen = FigmentGenerator(model, tokenizer)
     all_atomic = []
     for key in SOURCES:
-        dirs = sorted((DELTAS_DIR / key).glob("*.pdga"))
+        dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
         for d in dirs:
-            f = Fact.load(d)
-            if not f.is_narrative() and not f.is_trust_assertion():
+            f = Figment.load(d)
+            if not f.is_image() and not f.is_trust_assertion():
                 all_atomic.append(f)
 
     t0 = time.perf_counter()
     result = gen.generate(
-        facts=all_atomic,
+        figments=all_atomic,
         prompt="What happened at Davos?",
         max_new_tokens=100,
     )
@@ -93,21 +90,20 @@ def benchmark():
     results["generate"] = {
         "time": gen_time,
         "tokens": result["num_tokens"],
-        "facts": len(all_atomic),
+        "figments": len(all_atomic),
     }
     console.print(f"  {result['num_tokens']} tokens in {gen_time:.1f}s")
-    console.print(f"  Facts loaded: {len(all_atomic)}")
+    console.print(f"  Figments loaded: {len(all_atomic)}")
 
-    # Phase 3: Graph
     console.print("\n[bold]Phase 3: Graph[/bold]")
-    all_facts = []
+    all_figments = []
     for key in SOURCES:
-        dirs = sorted((DELTAS_DIR / key).glob("*.pdga"))
+        dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
         for d in dirs:
-            all_facts.append(Fact.load(d))
+            all_figments.append(Figment.load(d))
 
     t0 = time.perf_counter()
-    graph = FactGraph(all_facts)
+    graph = Figtree(all_figments)
     graph.deduplicate()
     graph.create_edges()
     graph.propagate_trust()
@@ -115,23 +111,22 @@ def benchmark():
 
     results["graph"] = {
         "time": graph_time,
-        "facts": len([f for f in all_facts if not f.is_edge() and not f.is_trust_assertion()]),
-        "edges": len([f for f in all_facts if f.is_edge()]),
+        "figments": len([f for f in all_figments if not f.is_edge() and not f.is_trust_assertion()]),
+        "edges": len([f for f in all_figments if f.is_edge()]),
     }
     console.print(f"  Graph built in {graph_time:.1f}s")
 
-    # Summary
     console.print("\n[bold]Benchmark Summary[/bold]")
     table = Table(show_header=True, header_style="bold")
     table.add_column("Phase")
     table.add_column("Time (s)", justify="right")
     table.add_column("Throughput")
     table.add_row("Ingestion", f"{results['ingest']['time']:.1f}",
-                    f"{results['ingest']['facts']} facts, {results['ingest']['size_kb']:.1f} KB")
+                    f"{results['ingest']['figments']} figments, {results['ingest']['size_kb']:.1f} KB")
     table.add_row("Generation", f"{results['generate']['time']:.1f}",
-                    f"{results['generate']['tokens']} tokens, {results['generate']['facts']} facts")
+                    f"{results['generate']['tokens']} tokens, {results['generate']['figments']} figments")
     table.add_row("Graph", f"{results['graph']['time']:.1f}",
-                    f"{results['graph']['facts']} facts, {results['graph']['edges']} edges")
+                    f"{results['graph']['figments']} figments, {results['graph']['edges']} edges")
     total = sum(r["time"] for r in results.values())
     table.add_row("Total", f"{total:.1f}", "")
     console.print(table)
