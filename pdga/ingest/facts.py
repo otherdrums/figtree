@@ -221,6 +221,7 @@ def ingest_narrative_with_facts(
         fact_results.append({
             "fact_id": fact_id,
             "path": fact_dir,
+            "text": fact["text"],
             "start_pos": start_pos,
             "end_pos": end_pos,
             "token_count": len(fact_tokens),

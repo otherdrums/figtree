@@ -14,7 +14,6 @@ from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from rich.console import Console
@@ -25,9 +24,9 @@ from rich.text import Text
 
 from pdga.ingest.facts import ingest_narrative_with_facts
 from pdga.db.store import DeltaDB
-from pdga.delta.cache_io import list_window_caches
 from pdga.generation.streaming import StreamingGenerator
-from pdga.generation.retrieval import retrieve_top_windows
+from pdga.graph.dedup import FactDeduper, make_embed_fn
+from pdga.graph.auto_edges import AutoEdgeGenerator
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -108,12 +107,22 @@ def do_ingest():
         
         # Register narrative
         db.register(
-            delta_id=result["narrative_id"], delta_type="context",
+            delta_id=result["narrative_id"], delta_type="narrative",
             path=str(narrative_dir),
             base_model=model.config._name_or_path or MODEL_ID,
             source_text=text, trust=source["trust"],
             num_windows=1, tags=["davos", key],
         )
+
+        # Register each fact as a delta
+        for f in result["facts"]:
+            db.register(
+                delta_id=f["fact_id"], delta_type="fact",
+                path=str(narrative_dir / "facts" / f["fact_id"]),
+                base_model=model.config._name_or_path or MODEL_ID,
+                source_text=f["text"], trust=source["trust"],
+                num_windows=0, tags=["davos", key, "fact"],
+            )
 
         pdga_size = sum(f.stat().st_size for f in narrative_dir.rglob("*")
                         if f.is_file()) / 1024
@@ -258,15 +267,115 @@ def do_generate():
     torch.cuda.empty_cache()
 
 
+def do_graph():
+    banner("PDGA Davos — Graph & Deduplication",
+           "Find shared facts, contradictions, and auto-generate edges")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="auto", trust_remote_code=True,
+    )
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    console.print("  Loaded model for embedding generation")
+
+    paths = sorted(DELTAS_DIR.glob("*.pdga"))
+
+    # Load all facts
+    deduper = FactDeduper(
+        embed_fn=make_embed_fn(model, tokenizer),
+        semantic_threshold=0.92,
+    )
+
+    all_facts = []
+    for path in paths:
+        facts = deduper.load_narrative_facts(path)
+        all_facts.extend(facts)
+        console.print(f"  Loaded {len(facts)} facts from {path.name}")
+
+    # Deduplicate
+    console.print("\n[bold]Deduplicating facts...[/bold]")
+    canonical = deduper.deduplicate(all_facts)
+
+    shared = deduper.get_shared_facts()
+    console.print(f"  Total canonical facts: {len(canonical)}")
+    console.print(f"  Shared across sources: {len(shared)}")
+
+    # Display shared facts
+    if shared:
+        console.print("\n[bold underline green]── Shared Facts ──[/bold underline green]")
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Canonical ID", style="dim", width=20)
+        table.add_column("Text")
+        table.add_column("Sources", width=30)
+        for sf in shared[:10]:
+            sources = ", ".join(
+                f"{s['narrative_id'][:8]}..." for s in sf["sources"]
+            )
+            text = sf["text"][:120] + "..." if len(sf["text"]) > 120 else sf["text"]
+            table.add_row(sf["canonical_id"][:16], text, sources)
+        console.print(table)
+
+    # Display unique facts per source
+    for key in SOURCES:
+        unique = deduper.get_unique_facts(key)
+        if unique:
+            console.print(f"\n[bold underline {SOURCES[key]['color']}]── Unique to {key} ──[/bold underline {SOURCES[key]['color']}]")
+            for uf in unique[:5]:
+                console.print(f"  • {uf['text'][:100]}")
+            if len(unique) > 5:
+                console.print(f"  ... and {len(unique) - 5} more")
+
+    # Generate graph edges
+    console.print("\n[bold]Generating graph edges...[/bold]")
+    db = DeltaDB()
+    edge_gen = AutoEdgeGenerator(db)
+    edge_gen.generate_all(paths, canonical, deduper.fact_to_canonical)
+
+    # Display edges summary
+    from pdga.graph.edges import EdgeType
+    for etype in EdgeType:
+        count = db.conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE edge_type=?", (etype.value,)
+        ).fetchone()[0]
+        if count > 0:
+            console.print(f"  {etype.value}: {count} edges")
+
+    # Sample edges
+    console.print("\n[bold underline blue]── Sample Edges ──[/bold underline blue]")
+    rows = db.conn.execute(
+        "SELECT * FROM edges LIMIT 20"
+    ).fetchall()
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Source", width=16)
+    table.add_column("Type", width=15)
+    table.add_column("Target", width=16)
+    table.add_column("Weight", width=8)
+    for row in rows:
+        table.add_row(row[0][:14], row[2], row[1][:14], f"{row[3]:.2f}")
+    console.print(table)
+
+    db.close()
+    console.print("\n[bold green]✓[/bold green] Graph generation complete")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     if cmd == "ingest":
         do_ingest()
     elif cmd == "generate":
         do_generate()
+    elif cmd == "graph":
+        do_graph()
     elif cmd == "all":
         do_ingest()
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         do_generate()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        do_graph()

@@ -16,6 +16,9 @@ class EdgeType(str, Enum):
     ENHANCES = "enhances"
     SAME_SOURCE = "same_source"
     REQUIRES = "requires"
+    PART_OF = "part_of"
+    SUPPORTS = "supports"
+    SAME_ENTITY = "same_entity"
 
 
 class EdgeOps:
