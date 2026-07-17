@@ -57,9 +57,14 @@ class Figment:
         trust: float = 0.5,
         boundaries: np.ndarray | None = None,
         boundary_emb: np.ndarray | None = None,
+        figment_id: str | None = None,
     ) -> "Figment":
-        """Factory: auto-generate figment_id from text."""
-        figment_id = hashlib.sha256(text.encode()).hexdigest()[:16]
+        """Factory: auto-generate figment_id from text (or use a provided id).
+
+        A provided ``figment_id`` enables idempotent, re-runnable figments
+        (e.g. one canonical trust Figment per source that can be overwritten).
+        """
+        figment_id = figment_id or hashlib.sha256(text.encode()).hexdigest()[:16]
         return cls(
             figment_id=figment_id,
             text=text,

@@ -19,6 +19,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
 
 from figtree.figment import Figment
+from figtree.kernel.prompt import build_prompt_ids
 
 
 class FigmentGenerator:
@@ -46,6 +47,7 @@ class FigmentGenerator:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.15,
     ) -> dict:
         device = self.device
         embed = self.model.get_input_embeddings()
@@ -55,7 +57,7 @@ class FigmentGenerator:
 
         num_figments = len(figments)
 
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = build_prompt_ids(self.tokenizer, prompt)
         P = len(prompt_ids)
 
         t0 = time.perf_counter()
@@ -122,7 +124,7 @@ class FigmentGenerator:
         gen_ids = list(prompt_ids)
         for step in range(max_new_tokens):
             with torch.no_grad():
-                nxt = _sample(logits, temperature, top_k, top_p)
+                nxt = _sample(logits, temperature, top_k, top_p, repetition_penalty, gen_ids)
             tid = int(nxt.item()) if hasattr(nxt, 'item') else int(nxt)
             if tid == self.eos:
                 break
@@ -172,6 +174,7 @@ class FigmentGenerator:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.15,
         cache_dir: str = "./figments",
     ) -> dict:
         """Generate using per-token cached K/V from disk.
@@ -208,7 +211,7 @@ class FigmentGenerator:
 
         total_tokens = sum(k.shape[1] for k in all_k)
 
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = build_prompt_ids(self.tokenizer, prompt)
         P = len(prompt_ids)
 
         t0 = time.perf_counter()
@@ -260,7 +263,7 @@ class FigmentGenerator:
         gen_ids = list(prompt_ids)
         for step in range(max_new_tokens):
             with torch.no_grad():
-                nxt = _sample(logits, temperature, top_k, top_p)
+                nxt = _sample(logits, temperature, top_k, top_p, repetition_penalty, gen_ids)
             tid = int(nxt.item()) if hasattr(nxt, 'item') else int(nxt)
             if tid == self.eos:
                 break
@@ -317,8 +320,16 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def _sample(logits, temperature, top_k, top_p):
-    logits_f = logits.squeeze().float()
+def _sample(logits, temperature, top_k, top_p, repetition_penalty=1.0, context=None):
+    logits_f = logits.squeeze().float().clone()
+    if repetition_penalty != 1.0 and context is not None and len(context) > 0:
+        # Penalize tokens already present in the generated context.
+        for tid in set(context):
+            if tid < logits_f.numel():
+                if logits_f[tid] > 0:
+                    logits_f[tid] /= repetition_penalty
+                else:
+                    logits_f[tid] *= repetition_penalty
     if temperature <= 0:
         return torch.tensor(int(logits_f.argmax(dim=-1).item()))
     probs = torch.softmax(logits_f / temperature, dim=-1)

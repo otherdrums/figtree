@@ -174,16 +174,19 @@ def do_generate():
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
         run_query(source["name"], figments, "What happened at Davos?", max_new_tokens=150)
 
-    # -- QUERY 2: Agreement --
-    console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? ──[/bold underline yellow]")
-    run_query("Agreement", all_figments,
-              "Based on all sources, what facts do they agree on?", max_new_tokens=200)
+    # -- QUERY 2: Agreement (trust-aware) --
+    console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? (trust-aware) ──[/bold underline yellow]")
+    _run_trust_aware(
+        "Agreement", "Based on all sources, what facts do they agree on?", gen,
+        source_figments, log_path,
+    )
 
-    # -- QUERY 3: Disagreement --
-    console.print("\n[bold underline red]── QUERY 3: Where Do Sources Disagree? ──[/bold underline red]")
-    run_query("Disagreement", all_figments,
-              "What are the major disagreements between the different perspectives?",
-              max_new_tokens=200)
+    # -- QUERY 3: Disagreement (trust-aware) --
+    console.print("\n[bold underline red]── QUERY 3: Where Do Sources Disagree? (trust-aware) ──[/bold underline red]")
+    _run_trust_aware(
+        "Disagreement", "What are the major disagreements between the different perspectives?",
+        gen, source_figments, log_path,
+    )
 
     # -- QUERY 4: Boundary-based generation (cached K/V) --
     console.print("\n[bold underline blue]── QUERY 4: Boundary-Based Generation (cached K/V) ──[/bold underline blue]")
@@ -209,6 +212,55 @@ def do_generate():
     console.print(f"[dim]Log saved to: {log_path}[/dim]")
 
 
+def _build_graph() -> "Figtree":
+    """Load all ingested figments and compute (persisted) source-based trust."""
+    from figtree.graph import Figtree
+
+    all_figments = []
+    for key in SOURCES:
+        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
+        for d in figment_dirs:
+            all_figments.append(Figment.load(d))
+    graph = Figtree(all_figments)
+    graph.propagate_trust(output_dir=FIGMENTS_DIR)  # idempotent, disk-persisted
+    return graph
+
+
+def _run_trust_aware(
+    query_label: str,
+    query: str,
+    gen: "FigmentGenerator",
+    source_figments_map: dict[str, list[Figment]],
+    log_path: Path,
+) -> None:
+    """Recall all perspectives on a query and explain credibility, then generate."""
+    graph = _build_graph()
+    ctx = graph.build_trust_aware_context(query)
+
+    console.print("\n[bold]Credibility context:[/bold]")
+    console.print(ctx["rationale"])
+    with open(log_path, "a") as f:
+        f.write(f"── {query_label} (trust-aware context) ──\n")
+        f.write(ctx["rationale"] + "\n\n")
+
+    # Collect figments from every source that recalled something for this query,
+    # so generation can weigh all perspectives (not just the highest-trust one).
+    all_relevant: list[Figment] = []
+    for src in ctx["by_source"]:
+        for fig in source_figments_map.get(src, []):
+            if set(query.lower().split()) & set(fig.text.lower().split()):
+                all_relevant.append(fig)
+
+    result = gen.generate(figments=all_relevant, prompt=query, max_new_tokens=200)
+    console.print(f"\n[bold]Output ({result['num_tokens']} tokens):[/bold]")
+    console.print(result["generated_text"])
+    console.print()
+    with open(log_path, "a") as f:
+        f.write(f"── {query_label} ──\nPrompt: {query}\n")
+        f.write(f"Tokens: {result['num_tokens']}\n")
+        f.write(result["generated_text"] + "\n\n")
+
+
 def do_graph():
     from datetime import datetime
 
@@ -226,18 +278,18 @@ def do_graph():
 
     dedup_edges = graph.deduplicate()
     auto_edges = graph.create_edges()
-    trust_scores = graph.propagate_trust()
+    trust_scores = graph.propagate_trust(output_dir=FIGMENTS_DIR)  # idempotent + persisted
 
     console.print(f"  Figments: {len([f for f in all_figments if not f.is_edge() and not f.is_trust_assertion()])}")
     console.print(f"  Dedup edges: {len(dedup_edges)}")
     console.print(f"  Auto edges: {len(auto_edges)}")
     console.print(f"  Trust scores updated: {len(trust_scores)}")
 
-    top = graph.get_top_figments(10)
-    console.print("\n[bold underline green]── Top Trusted Figments ──[/bold underline green]")
-    for i, f in enumerate(top, 1):
-        console.print(f"\n[bold]{i}.[/bold] trust={f.trust:.2f}  id={f.figment_id}")
-        console.print(f"  {f.text}")
+    analysis = graph.analyze_sources()
+    console.print("\n[bold underline green]── Source Credibility (trust-aware) ──[/bold underline green]")
+    for src, info in sorted(analysis.items(), key=lambda kv: kv[1]["adjusted_trust"], reverse=True):
+        console.print(f"\n[bold]{src}[/bold]  adjusted_trust={info['adjusted_trust']:.2f}  base={info['base_trust']:.2f}")
+        console.print(f"  {info['rationale']}")
     console.print()
 
     with open(log_path, "w") as f:
@@ -249,10 +301,10 @@ def do_graph():
         f.write(f"Dedup edges: {len(dedup_edges)}\n")
         f.write(f"Auto edges: {len(auto_edges)}\n")
         f.write(f"Trust scores updated: {len(trust_scores)}\n\n")
-        f.write("── Top Trusted Figments ──\n")
-        for i, fig in enumerate(top, 1):
-            f.write(f"\n{i}. trust={fig.trust:.2f}  id={fig.figment_id}\n")
-            f.write(f"   {fig.text}\n")
+        f.write("── Source Credibility ──\n")
+        for src, info in sorted(analysis.items(), key=lambda kv: kv[1]["adjusted_trust"], reverse=True):
+            f.write(f"\n{src}  adjusted_trust={info['adjusted_trust']:.2f}  base={info['base_trust']:.2f}\n")
+            f.write(f"  {info['rationale']}\n")
         f.write("\n")
 
     console.print("[bold green]Graph complete[/bold green]")

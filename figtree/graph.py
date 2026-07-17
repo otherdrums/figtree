@@ -4,18 +4,41 @@ Instead of a separate graph database, every relationship is a Figment:
 - "Figment A supports Figment B" -> Figment with meta["edge_type"] = "supports"
 - "Figment C has trust 0.95" -> Figment with meta["edge_type"] = "trust"
 - "Figment D contradicts Figment E" -> Figment with meta["edge_type"] = "contradicts"
+
+Trust design (recall-aware + mutable):
+- Trust is SOURCE-based. Each source carries a base trust score; the system
+  recalls every perspective and explains each one's credibility from (a) the
+  source's base trust and (b) how many *other* sources corroborate or contradict
+  its claims.
+- Trust Figments are canonical per source_id and are persisted to disk by
+  `propagate_trust(output_dir=...)` so the score is re-runnable and editable:
+  a future "accuracy proven -> trust up" step only edits `meta["score"]` and
+  re-runs `propagate_trust`, overwriting the same file. No schema change needed.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 
 from figtree.figment import Figment
 
+# Lexicons used for lightweight, explainable contradiction detection.
+_POSITIVE_CUES = {
+    "unanimous", "binding", "endorsed", "adopted", "agreement", "landmark",
+    "committed", "guarantees", "legally", "comprehensive", "historic",
+}
+_NEGATIVE_CUES = {
+    "not binding", "no agreement", "failed", "vague", "contradict", "walked out",
+    "unenforceable", "aspirational", "loopholes", "detained", "hidden", "refused",
+    "critics", "skeptic", "doubts", "disputed",
+}
+
 
 class Figtree:
-    """Graph of figments — manages relationships, dedup, and trust propagation."""
+    """Graph of figments — manages relationships, trust, and credibility."""
 
     def __init__(self, figments: list[Figment] | None = None):
         self.figments: dict[str, Figment] = {}
@@ -23,10 +46,119 @@ class Figtree:
         if figments:
             for f in figments:
                 self.add_figment(f)
+        # source_id -> list of atomic figment ids
+        self.by_source: dict[str, list[str]] = defaultdict(list)
+        self._reindex_sources()
 
     def add_figment(self, figment: Figment) -> None:
         self.figments[figment.figment_id] = figment
 
+    def _reindex_sources(self) -> None:
+        self.by_source = defaultdict(list)
+        for fid, fig in self.figments.items():
+            if fig.is_edge() or fig.is_trust_assertion():
+                continue
+            src = fig.meta.get("source_id", "")
+            if src:
+                self.by_source[src].append(fid)
+
+    # ------------------------------------------------------------------ #
+    # Credibility model
+    # ------------------------------------------------------------------ #
+    def _source_base_trust(self) -> dict[str, float]:
+        """Map source_id -> immutable base trust (from the image figment).
+
+        Base trust is fixed at ingest time (stored on the image figment's
+        `meta["base_trust"]`). Persisted `trust:{src}` figments carry the
+        *adjusted* score and must NOT be read back as base, otherwise trust
+        would drift on every reload.
+        """
+        base: dict[str, float] = {}
+        for src in self.by_source:
+            src_base = 0.5
+            for fid in self.by_source[src]:
+                fig = self.figments[fid]
+                # the image figment (parent) carries base_trust
+                if fig.meta.get("is_image"):
+                    src_base = float(fig.meta.get("base_trust", fig.trust))
+                    break
+            base[src] = src_base
+        return base
+
+    def _entities(self, fig: Figment) -> set[str]:
+        tokens = fig.text.split()
+        return {t.strip(".,!?;:").lower() for t in tokens if t and t[0].isupper()}
+
+    def _cue(self, fig: Figment) -> str:
+        t = fig.text.lower()
+        if any(c in t for c in _NEGATIVE_CUES):
+            return "negative"
+        if any(c in t for c in _POSITIVE_CUES):
+            return "positive"
+        return "neutral"
+
+    def analyze_sources(self) -> dict[str, dict]:
+        """Compute per-source corroboration/contradiction.
+
+        Returns source_id -> {
+            "base_trust", "corroborating": [sources], "contradicting": [sources],
+            "corroborated_frac", "adjusted_trust", "rationale": str
+        }
+        """
+        base = self._source_base_trust()
+        sources = list(self.by_source.keys())
+
+        corroborating: dict[str, set] = defaultdict(set)
+        contradicting: dict[str, set] = defaultdict(set)
+        fig_corroborated: dict[str, bool] = {}
+
+        src_figs = {s: [self.figments[i] for i in self.by_source[s]] for s in sources}
+        for i in range(len(sources)):
+            for j in range(i + 1, len(sources)):
+                a, b = sources[i], sources[j]
+                for fa in src_figs[a]:
+                    for fb in src_figs[b]:
+                        shared = self._entities(fa) & self._entities(fb)
+                        if not shared:
+                            continue
+                        cue_a, cue_b = self._cue(fa), self._cue(fb)
+                        if cue_a != cue_b and "neutral" not in (cue_a, cue_b):
+                            contradicting[a].add(b)
+                            contradicting[b].add(a)
+                        else:
+                            corroborating[a].add(b)
+                            corroborating[b].add(a)
+                            fig_corroborated[fa.figment_id] = True
+                            fig_corroborated[fb.figment_id] = True
+
+        result: dict[str, dict] = {}
+        for s in sources:
+            figs = src_figs[s]
+            corr = round(sum(1 for f in figs if fig_corroborated.get(f.figment_id, False)) / max(1, len(figs)), 2)
+            b_trust = base.get(s, 0.5)
+            adj = 0.6 * b_trust + 0.4 * corr
+            if contradicting[s]:
+                adj *= 0.85
+            adj = float(min(1.0, max(0.0, adj)))
+            rationale = (
+                f"base_trust={b_trust:.2f}, shares claims with "
+                f"{sorted(corroborating[s]) or 'none'} "
+                f"({corr * 100:.0f}% of claims), "
+                f"contradicted by {sorted(contradicting[s]) or 'none'}"
+            )
+            result[s] = {
+                "base_trust": b_trust,
+                "corroborating": sorted(corroborating[s]),
+                "contradicting": sorted(contradicting[s]),
+                "corroborated_frac": corr,
+                "adjusted_trust": adj,
+                "rationale": rationale,
+            }
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Edges
+    # ------------------------------------------------------------------ #
     def deduplicate(self) -> list[Figment]:
         """Deduplicate figments by exact text match + semantic boundary similarity."""
         edges = []
@@ -40,7 +172,6 @@ class Figtree:
                     canonical = a.figment_id
                     duplicate = b.figment_id
                     self.canonical[duplicate] = canonical
-
                     edge = Figment.create(
                         text=f"Figment {canonical[:8]} supports figment {fid_list[j][:8]}",
                         boundary=a.boundary.copy(),
@@ -57,7 +188,6 @@ class Figtree:
                         canonical = a.figment_id
                         duplicate = b.figment_id
                         self.canonical[duplicate] = canonical
-
                         edge = Figment.create(
                             text=f"Figment {canonical[:8]} supports figment {duplicate[:8]}",
                             boundary=a.boundary.copy(),
@@ -66,19 +196,16 @@ class Figtree:
                             children=[duplicate],
                         )
                         edges.append(edge)
-
         return edges
 
     def create_edges(self) -> list[Figment]:
         """Auto-create SUPPORTS, SAME_ENTITY edges based on entity overlap."""
         edges = []
-
         entities: dict[str, list[str]] = {}
         for fid, fig in self.figments.items():
             if fig.is_edge() or fig.is_trust_assertion():
                 continue
-            tokens = fig.text.split()
-            caps = {t.strip(".,!?;:") for t in tokens if t and t[0].isupper()}
+            caps = {t.strip(".,!?;:") for t in fig.text.split() if t and t[0].isupper()}
             entities[fid] = list(caps)
 
         fid_list = list(entities.keys())
@@ -94,42 +221,88 @@ class Figtree:
                         children=[fid_list[j]],
                     )
                     edges.append(edge)
-
         return edges
 
-    def propagate_trust(self) -> list[dict]:
-        """Propagate trust through the figment graph."""
+    def propagate_trust(self, output_dir: Path | None = None) -> list[dict]:
+        """Recompute + (optionally) persist canonical trust Figments per source.
+
+        Idempotent: a single trust Figment per source_id is (re)created with a
+        deterministic id and overwrites the previous one on disk, so future trust
+        adjustments only need to edit `meta["score"]` and re-run this method.
+        """
+        analysis = self.analyze_sources()
         updates = []
+        for src, info in analysis.items():
+            fid = f"trust:{src}"
+            trust_fig = Figment.create(
+                text=f"Source {src} has adjusted trust {info['adjusted_trust']:.2f} "
+                     f"(base {info['base_trust']:.2f})",
+                boundary=np.zeros(1, dtype=np.float32),
+                meta={
+                    "edge_type": "trust",
+                    "source_id": src,
+                    "score": info["adjusted_trust"],
+                    "base_trust": info["base_trust"],
+                    "corroborating": info["corroborating"],
+                    "contradicting": info["contradicting"],
+                    "corroborated_frac": info["corroborated_frac"],
+                    "rationale": info["rationale"],
+                },
+                figment_id=fid,
+                trust=info["adjusted_trust"],
+            )
+            for f in self.by_source.get(src, []):
+                self.figments[f].trust = info["adjusted_trust"]
+            self.figments[fid] = trust_fig
+            updates.append({"source_id": src, "trust": info["adjusted_trust"], **info})
 
-        for fid, fig in self.figments.items():
-            if not fig.is_trust_assertion():
-                continue
-            about = fig.meta.get("about_figment")
-            score = fig.meta.get("score", 0.5)
-            if about and about in self.figments:
-                self.figments[about].trust = score
-                updates.append({"figment_id": about, "trust": score, "source": "base"})
-
-        for fid, fig in self.figments.items():
-            if not fig.is_trust_assertion() and not fig.is_edge():
-                self.figments[fid].trust = self.figments[fid].trust or 0.3
-
-        children_map: dict[str, list[str]] = {}
-        for fid, fig in self.figments.items():
-            if fig.is_trust_assertion():
-                about = fig.meta.get("about_figment")
-                if about:
-                    children_map.setdefault(fig.meta.get("about_figment"), []).append(fid)
-
-        for fid, fig in self.figments.items():
-            if not fig.is_edge() or fig.meta.get("edge_type") != "contradicts":
-                continue
-            for child in fig.children:
-                if child in self.figments:
-                    self.figments[child].trust *= 0.5
-                    updates.append({"figment_id": child, "trust": self.figments[child].trust, "source": "contradiction"})
+            if output_dir is not None:
+                out = Path(output_dir) / src
+                out.mkdir(parents=True, exist_ok=True)
+                trust_fig.save(out)
 
         return updates
+
+    # ------------------------------------------------------------------ #
+    # Trust-aware retrieval / explanation
+    # ------------------------------------------------------------------ #
+    def build_trust_aware_context(self, query: str, limit: int = 6) -> dict:
+        """Recall all perspectives relevant to `query`, with credibility notes.
+
+        Returns {
+            "query", "by_source": {src: {"trust", "figments", "rationale"}},
+            "rationale": str,   # synthesized credibility explanation
+        }
+        """
+        analysis = self.analyze_sources()
+        qwords = set(query.lower().split())
+        scored = []
+        for src, fids in self.by_source.items():
+            for f in fids:
+                fig = self.figments[f]
+                if fig.is_edge() or fig.is_trust_assertion():
+                    continue
+                overlap = len(qwords & set(fig.text.lower().split()))
+                if overlap > 0:
+                    scored.append((overlap, src, fig.text))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        by_source: dict[str, dict] = {}
+        for _, src, text in scored[:limit]:
+            info = analysis.get(src, {})
+            by_source.setdefault(src, {
+                "trust": info.get("adjusted_trust", 0.5),
+                "rationale": info.get("rationale", ""),
+                "figments": [],
+            })
+            by_source[src]["figments"].append(text)
+
+        parts = []
+        for src, d in by_source.items():
+            parts.append(f"{src} (trust {d['trust']:.2f}): {d['rationale']}")
+        rationale = "\n".join(parts) if parts else "No relevant figments recalled."
+
+        return {"query": query, "by_source": by_source, "rationale": rationale}
 
     def get_top_figments(self, limit: int = 10) -> list[Figment]:
         """Return figments sorted by trust (highest first)."""

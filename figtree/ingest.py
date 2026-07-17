@@ -178,6 +178,38 @@ def ingest_text_to_figments(
             storage[layer_idx] = o.detach()
         return hook
 
+    # Build one concatenated token stream with separators between sentences,
+    # exactly mirroring FigmentGenerator.generate(). A single forward through the
+    # model captures cross-figment attention, so the cached K/V we slice per
+    # figment match what generate() would produce -> boundary replay == text forward.
+    sep_ids = tokenizer.encode("\n\n", add_special_tokens=False)
+    stream: list[int] = []
+    starts: list[int] = []
+    kept_sentences: list[str] = []
+    for sent in sentences:
+        ids = tokenizer.encode(sent, add_special_tokens=False)
+        if not ids:
+            continue
+        if stream:
+            stream.extend(sep_ids)
+        starts.append(len(stream))
+        stream.extend(ids)
+        kept_sentences.append(sent)
+
+    if not stream:
+        raise ValueError("Text produced zero tokens")
+
+    # Each figment's cached slice spans its tokens AND the separator that follows
+    # it, so concatenated slices reproduce the full stream (separators included)
+    # and generate_from_boundaries can replay without any extra forward pass.
+    spans: list[tuple[int, int]] = []  # (start, end_exclusive) per sentence
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(stream)
+        spans.append((start, end))
+
+    all_ids = torch.tensor([stream], dtype=torch.long, device=device)
+    seq_len_total = all_ids.shape[1]
+
     layer_outputs: dict[int, torch.Tensor] = {}
     handles = []
     for li in range(num_layers):
@@ -185,46 +217,50 @@ def ingest_text_to_figments(
 
     try:
         with torch.no_grad():
-            for sent in sentences:
-                ids = tokenizer.encode(sent, return_tensors="pt").to(device)
-                if ids.shape[1] == 0:
+            emb_out = model.get_input_embeddings()(all_ids)
+            model(all_ids)
+
+            if len(layer_outputs) != num_layers:
+                raise RuntimeError(f"Expected {num_layers} layer outputs, got {len(layer_outputs)}")
+
+            # Full-stream per-layer hidden states (the input to each layer).
+            # layer li input hidden = emb_out for li==0 else layer_outputs[li-1][0].
+            layer_inputs: list[torch.Tensor] = [emb_out[0]]
+            for li in range(1, num_layers):
+                layer_inputs.append(layer_outputs[li - 1][0])
+
+            # Precompute K/V for every token at every layer across the whole stream.
+            full_kv: list[torch.Tensor] = []  # list over layers of (seq_len_total, 2, kv_dim)
+            for li in range(num_layers):
+                k, v = _project_kv(layer_inputs[li], model.model.layers[li], num_kv_heads, head_dim, use_kernel)
+                k = k.reshape(seq_len_total, kv_dim)
+                v = v.reshape(seq_len_total, kv_dim)
+                full_kv.append(torch.stack([k, v], dim=1).float().cpu())
+
+            for si, (sent, (start, end)) in enumerate(zip(kept_sentences, spans)):
+                if end <= start:
                     continue
+                # Per-figment K/V slice for all layers (includes trailing separator).
+                kv_cache_list = [full_kv[li][start:end] for li in range(num_layers)]
+                kv_cache_t = torch.stack(kv_cache_list).numpy()
 
-                emb_out = model.get_input_embeddings()(ids)
-                boundary_emb = emb_out[0, -1, :].float().cpu()
-
-                model(ids)
-
-                if len(layer_outputs) != num_layers:
-                    raise RuntimeError(f"Expected {num_layers} layer outputs, got {len(layer_outputs)}")
-
+                # Last real token of this sentence (exclude trailing separator if any).
+                last_tok = end - 1
+                if si + 1 < len(starts):
+                    last_tok -= len(sep_ids)
+                # boundaries: hidden state of the last real token, per layer.
                 boundaries_list = [
-                    layer_outputs[li][0, -1, :].float().cpu()
-                    for li in range(num_layers)
+                    layer_outputs[li][0, last_tok, :].float().cpu() for li in range(num_layers)
                 ]
                 boundaries_arr = torch.stack(boundaries_list).numpy()
                 boundary_crystal = boundaries_arr[crystal_layer]
-
-                seq_len = ids.shape[1]
-                kv_cache_list = []
-                for li in range(num_layers):
-                    if li == 0:
-                        h_in = emb_out[0]
-                    else:
-                        h_in = layer_outputs[li - 1][0]
-                    layer = model.model.layers[li]
-                    k, v = _project_kv(h_in, layer, num_kv_heads, head_dim, use_kernel)
-                    k_cache = k.reshape(seq_len, kv_dim)
-                    v_cache = v.reshape(seq_len, kv_dim)
-                    kv_cache_list.append(torch.stack([k_cache, v_cache], dim=1))
-
-                kv_cache_t = torch.stack(kv_cache_list).float().cpu().numpy()
+                boundary_emb = emb_out[0, last_tok, :].float().cpu().numpy()
 
                 figment = Figment.create(
                     text=sent,
                     boundary=boundary_crystal,
                     boundaries=boundaries_arr,
-                    boundary_emb=boundary_emb.numpy(),
+                    boundary_emb=boundary_emb,
                     meta={"source_id": source_id, "crystal_layer": crystal_layer},
                     trust=trust,
                 )
@@ -233,11 +269,11 @@ def ingest_text_to_figments(
                 figment_dir = figment.save(output_dir)
                 np.save(figment_dir / "kv_cache.npy", kv_cache_t)
 
-                layer_outputs.clear()
+            layer_outputs.clear()
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
     finally:
         for h in handles:
@@ -246,7 +282,7 @@ def ingest_text_to_figments(
     image = Figment.create(
         text=text,
         boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
-        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True},
+        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True, "base_trust": trust},
         children=[f.figment_id for f in sentence_figments],
         trust=trust,
     )
@@ -254,7 +290,7 @@ def ingest_text_to_figments(
     trust_figment = Figment.create(
         text=f"Source {source_id} has trust {trust:.2f}",
         boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
-        meta={"edge_type": "trust", "about_figment": image.figment_id, "score": trust},
+        meta={"edge_type": "trust", "about_figment": image.figment_id, "score": trust, "base_trust": trust},
         sources=[image.figment_id],
     )
 
