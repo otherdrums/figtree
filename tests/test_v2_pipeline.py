@@ -61,7 +61,7 @@ def main():
         max_new_tokens=80,
     )
     print(f"Generated {result['num_tokens']} tokens in {result['elapsed']:.1f}s")
-    print(f"Text: {result['generated_text'][:200]}")
+    print(f"Text: {result['generated_text']}")
 
     # Boundary-based generation (cached K/V from disk)
     print("\nGenerating from cached boundaries (kv_cache.npy)...")
@@ -72,7 +72,7 @@ def main():
         cache_dir=str(FIGMENTS_DIR),
     )
     print(f"Generated {result_bd['num_tokens']} tokens in {result_bd['elapsed']:.1f}s")
-    print(f"Text: {result_bd['generated_text'][:200]}")
+    print(f"Text: {result_bd['generated_text']}")
 
     # Correctness check for the cached-K/V path: it must produce a grounded,
     # on-topic answer (the cached K/V replicate the text-based forward).

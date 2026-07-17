@@ -98,14 +98,14 @@ def main():
             console.print("Commands: /trust, /sources, /figments <key>, /all, /quit")
             continue
         elif query == "/trust":
-            top = graph.get_top_figments(10)
+            analysis = graph.analyze_sources()
             table = Table(show_header=True, header_style="bold")
-            table.add_column("Trust", width=8, justify="right")
-            table.add_column("Source", width=15)
-            table.add_column("Text")
-            for f in top:
-                src = f.meta.get("source_id", "unknown")[:14]
-                table.add_row(f"{f.trust:.2f}", src, f.text[:80])
+            table.add_column("Source", width=16)
+            table.add_column("Adj Trust", width=10, justify="right")
+            table.add_column("Base", width=7, justify="right")
+            table.add_column("Rationale")
+            for src, info in sorted(analysis.items(), key=lambda kv: kv[1]["adjusted_trust"], reverse=True):
+                table.add_row(src, f"{info['adjusted_trust']:.2f}", f"{info['base_trust']:.2f}", info["rationale"])
             console.print(table)
             continue
         elif query == "/sources":
@@ -120,10 +120,10 @@ def main():
                 console.print(f"[red]Unknown: {key}[/red]")
                 continue
             dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-            for i, d in enumerate(dirs[:5], 1):
+            for i, d in enumerate(dirs, 1):
                 f = Figment.load(d)
                 if not f.is_image() and not f.is_trust_assertion():
-                    console.print(f"  {i}. {f.text[:80]}")
+                    console.print(f"  {i}. {f.text}")
             continue
         elif query == "/all":
             figments = [f for f in all_figments if not f.is_image() and not f.is_trust_assertion()]
