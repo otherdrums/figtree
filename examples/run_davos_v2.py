@@ -185,6 +185,26 @@ def do_generate():
               "What are the major disagreements between the different perspectives?",
               max_new_tokens=200)
 
+    # -- QUERY 4: Boundary-based generation (cached K/V) --
+    console.print("\n[bold underline blue]── QUERY 4: Boundary-Based Generation (cached K/V) ──[/bold underline blue]")
+    for key, figments in source_figments.items():
+        source = SOURCES[key]
+        console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
+        try:
+            result_bd = gen.generate_from_boundaries(
+                figments=figments, prompt="What happened at Davos?",
+                max_new_tokens=150, cache_dir=str(FIGMENTS_DIR / key),
+            )
+            console.print(f"\n[bold]Output ({result_bd['num_tokens']} tokens, {result_bd['elapsed']:.1f}s):[/bold]")
+            console.print(result_bd["generated_text"])
+            console.print()
+            with open(log_path, "a") as f:
+                f.write(f"── {source['name']} (boundary-based) ──\n")
+                f.write(f"Tokens: {result_bd['num_tokens']}, Elapsed: {result_bd['elapsed']:.1f}s\n")
+                f.write(result_bd["generated_text"] + "\n\n")
+        except FileNotFoundError as e:
+            console.print(f"[yellow]Skipped: {e}[/yellow]")
+
     console.print("\n[bold green]Figtree Davos v2 generation complete[/bold green]")
     console.print(f"[dim]Log saved to: {log_path}[/dim]")
 
@@ -235,7 +255,7 @@ def do_graph():
             f.write(f"   {fig.text}\n")
         f.write("\n")
 
-    console.print(f"[bold green]Graph complete[/bold green]")
+    console.print("[bold green]Graph complete[/bold green]")
     console.print(f"[dim]Log saved to: {log_path}[/dim]")
 
 

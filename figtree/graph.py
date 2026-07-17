@@ -8,7 +8,6 @@ Instead of a separate graph database, every relationship is a Figment:
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
 

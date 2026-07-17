@@ -63,10 +63,13 @@ class FigmentGenerator:
         with torch.no_grad():
             cache = DynamicCache()
 
+            sep_ids = self.tokenizer.encode("\n\n", add_special_tokens=False)
             all_figment_ids = []
             for figment in figments:
                 fid = self.tokenizer.encode(figment.text, add_special_tokens=False)
                 if fid:
+                    if all_figment_ids:
+                        all_figment_ids.extend(sep_ids)
                     all_figment_ids.extend(fid)
 
             total_figment_len = len(all_figment_ids)

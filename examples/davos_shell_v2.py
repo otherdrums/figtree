@@ -98,7 +98,7 @@ def main():
             console.print("Commands: /trust, /sources, /figments <key>, /all, /quit")
             continue
         elif query == "/trust":
-            top = graph.get_top_facts(10)
+            top = graph.get_top_figments(10)
             table = Table(show_header=True, header_style="bold")
             table.add_column("Trust", width=8, justify="right")
             table.add_column("Source", width=15)

@@ -24,6 +24,53 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 from figtree.figment import Figment
 
 
+def _is_quantized(model: PreTrainedModel) -> bool:
+    """True if the model uses 4-bit/8-bit quantization (bitsandbytes)."""
+    if getattr(model, "is_quantized", False):
+        return True
+    try:
+        from bitsandbytes.nn import Linear4bit, Linear8bit
+    except Exception:
+        return False
+    for module in model.modules():
+        if isinstance(module, (Linear4bit, Linear8bit)):
+            return True
+    return False
+
+
+def _project_kv(
+    hidden: torch.Tensor,
+    layer: torch.nn.Module,
+    num_kv_heads: int,
+    head_dim: int,
+    use_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project normed hidden states through a layer's k_proj/v_proj.
+
+    `hidden` is (seq_len, hidden_size). Returns unrotated k, v each
+    (seq_len, kv_dim). Uses the custom CUDA kernel for non-quantized
+    bf16/fp16 models; falls back to PyTorch matmul otherwise.
+    """
+    h_normed = layer.input_layernorm(hidden)
+    if use_kernel and h_normed.dtype in (torch.bfloat16, torch.float16):
+        from figtree.kernel.boundary_project import project_boundaries_to_kv
+
+        k_fig, v_fig = project_boundaries_to_kv(
+            h_normed.view(-1, h_normed.shape[-1]).contiguous(), layer
+        )
+        k = k_fig.reshape(-1, num_kv_heads * head_dim)
+        v = v_fig.reshape(-1, num_kv_heads * head_dim)
+    else:
+        k_unrot = layer.self_attn.k_proj(h_normed)
+        v = layer.self_attn.v_proj(h_normed)
+        k = k_unrot
+    if hasattr(layer.self_attn, "k_norm"):
+        k = k.view(-1, num_kv_heads, head_dim)
+        k = layer.self_attn.k_norm(k)
+        k = k.reshape(-1, num_kv_heads * head_dim)
+    return k, v
+
+
 def split_into_sentences(text: str, min_chars: int = 20) -> list[str]:
     """Split text into sentences, merging very short fragments."""
     raw = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
@@ -127,6 +174,7 @@ def ingest_text_to_figments(
     num_kv_heads = config.num_key_value_heads
     head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
     kv_dim = num_kv_heads * head_dim
+    use_kernel = not _is_quantized(model)
 
     def make_hook(layer_idx, storage):
         def hook(mod, inp, out):
@@ -169,15 +217,10 @@ def ingest_text_to_figments(
                     else:
                         h_in = layer_outputs[li - 1][0]
                     layer = model.model.layers[li]
-                    h_normed = layer.input_layernorm(h_in)
-                    k_unrot = layer.self_attn.k_proj(h_normed)
-                    v = layer.self_attn.v_proj(h_normed)
-                    k_normed = k_unrot.view(1, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-                    if hasattr(layer.self_attn, "k_norm"):
-                        k_normed = layer.self_attn.k_norm(k_normed)
-                    k_unrot = k_normed.transpose(1, 2).reshape(seq_len, kv_dim)
-                    v = v.reshape(seq_len, kv_dim)
-                    kv_cache_list.append(torch.stack([k_unrot, v], dim=1))
+                    k, v = _project_kv(h_in, layer, num_kv_heads, head_dim, use_kernel)
+                    k_cache = k.reshape(seq_len, kv_dim)
+                    v_cache = v.reshape(seq_len, kv_dim)
+                    kv_cache_list.append(torch.stack([k_cache, v_cache], dim=1))
 
                 kv_cache_t = torch.stack(kv_cache_list).float().cpu().numpy()
 
