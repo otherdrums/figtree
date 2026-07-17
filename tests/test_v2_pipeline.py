@@ -58,7 +58,7 @@ def main():
     result = gen.generate(
         figments=atomic_figments,
         prompt="What happened at Davos?",
-        max_new_tokens=80,
+        max_new_tokens=200,
     )
     print(f"Generated {result['num_tokens']} tokens in {result['elapsed']:.1f}s")
     print(f"Text: {result['generated_text']}")
@@ -68,7 +68,7 @@ def main():
     result_bd = gen.generate_from_boundaries(
         figments=atomic_figments,
         prompt="What happened at Davos?",
-        max_new_tokens=80,
+        max_new_tokens=200,
         cache_dir=str(FIGMENTS_DIR),
     )
     print(f"Generated {result_bd['num_tokens']} tokens in {result_bd['elapsed']:.1f}s")

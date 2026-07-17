@@ -172,7 +172,7 @@ def do_generate():
     for key, figments in source_figments.items():
         source = SOURCES[key]
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
-        run_query(source["name"], figments, "What happened at Davos?", max_new_tokens=150)
+        run_query(source["name"], figments, "What happened at Davos? Recount the key details, figures, and claims from this source's narrative.", max_new_tokens=400)
 
     # -- QUERY 2: Agreement (trust-aware) --
     console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? (trust-aware) ──[/bold underline yellow]")
@@ -195,8 +195,8 @@ def do_generate():
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
         try:
             result_bd = gen.generate_from_boundaries(
-                figments=figments, prompt="What happened at Davos?",
-                max_new_tokens=150, cache_dir=str(FIGMENTS_DIR / key),
+                figments=figments, prompt="What happened at Davos? Recount the key details, figures, and claims from this source's narrative.",
+                max_new_tokens=400, cache_dir=str(FIGMENTS_DIR / key),
             )
             console.print(f"\n[bold]Output ({result_bd['num_tokens']} tokens, {result_bd['elapsed']:.1f}s):[/bold]")
             console.print(result_bd["generated_text"])
@@ -251,7 +251,7 @@ def _run_trust_aware(
             if set(query.lower().split()) & set(fig.text.lower().split()):
                 all_relevant.append(fig)
 
-    result = gen.generate(figments=all_relevant, prompt=query, max_new_tokens=200)
+    result = gen.generate(figments=all_relevant, prompt=query, max_new_tokens=450)
     console.print(f"\n[bold]Output ({result['num_tokens']} tokens):[/bold]")
     console.print(result["generated_text"])
     console.print()
