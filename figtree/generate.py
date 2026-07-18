@@ -175,13 +175,15 @@ class FigmentGenerator:
         top_k: int = 50,
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
+        kv_manager=None,
         cache_dir: str = "./figments",
     ) -> dict:
-        """Generate using per-token cached K/V from disk.
+        """Generate using per-token cached K/V.
 
-        Each figment stores pre-computed unrotated K/V for every token at every
-        layer (computed during ingestion). This loads the cached K/V, applies
-        RoPE based on global positions, and populates the cache directly.
+        K/V is obtained from ``kv_manager.materialize`` (LanceDB-backed, lazy by
+        default — recomputes on demand; eager if blobs were persisted at ingest).
+        For backward compatibility, if ``kv_manager`` is None and ``cache_dir`` is
+        provided, K/V is loaded from ``cache_dir/<id>.figment/kv_cache.npy``.
         """
         device = self.device
         embed = self.model.get_input_embeddings()
@@ -189,25 +191,34 @@ class FigmentGenerator:
         final_norm = self.model.model.norm
         rotary = self.model.model.rotary_emb
         config = self.model.config
-        cache_root = Path(cache_dir)
 
         num_kv_heads = config.num_key_value_heads
         head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
 
         all_k: list[torch.Tensor] = []
         all_v: list[torch.Tensor] = []
-        for fig in figments:
-            fdir = cache_root / f"{fig.figment_id}.figment"
-            kv_path = fdir / "kv_cache.npy"
-            if not kv_path.exists():
-                raise FileNotFoundError(
-                    f"No kv_cache.npy for figment {fig.figment_id[:12]}... "
-                    f"Re-ingest the text or use generate() instead."
-                )
-            kv = np.load(str(kv_path))
-            kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-            all_k.append(kv_t[:, :, 0, :])
-            all_v.append(kv_t[:, :, 1, :])
+
+        if kv_manager is not None:
+            kv_map = kv_manager.materialize(figments)
+            for fig in figments:
+                kv = kv_map[fig.figment_id]
+                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
+                all_k.append(kv_t[:, :, 0, :])
+                all_v.append(kv_t[:, :, 1, :])
+        else:
+            cache_root = Path(cache_dir)
+            for fig in figments:
+                fdir = cache_root / f"{fig.figment_id}.figment"
+                kv_path = fdir / "kv_cache.npy"
+                if not kv_path.exists():
+                    raise FileNotFoundError(
+                        f"No kv_cache.npy for figment {fig.figment_id[:12]}... "
+                        f"Re-ingest the text or use generate() instead."
+                    )
+                kv = np.load(str(kv_path))
+                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
+                all_k.append(kv_t[:, :, 0, :])
+                all_v.append(kv_t[:, :, 1, :])
 
         total_tokens = sum(k.shape[1] for k in all_k)
 

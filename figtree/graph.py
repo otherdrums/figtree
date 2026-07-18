@@ -40,9 +40,10 @@ _NEGATIVE_CUES = {
 class Figtree:
     """Graph of figments — manages relationships, trust, and credibility."""
 
-    def __init__(self, figments: list[Figment] | None = None):
+    def __init__(self, figments: list[Figment] | None = None, store=None):
         self.figments: dict[str, Figment] = {}
         self.canonical: dict[str, str] = {}
+        self.store = store
         if figments:
             for f in figments:
                 self.add_figment(f)
@@ -239,12 +240,12 @@ class Figtree:
                     edges.append(edge)
         return edges
 
-    def propagate_trust(self, output_dir: Path | None = None) -> list[dict]:
+    def propagate_trust(self, output_dir: Path | None = None, store=None) -> list[dict]:
         """Recompute + (optionally) persist canonical trust Figments per source.
 
         Idempotent: a single trust Figment per source_id is (re)created with a
-        deterministic id and overwrites the previous one on disk, so future trust
-        adjustments only need to edit `meta["score"]` and re-run this method.
+        deterministic id and overwrites the previous one on disk / in the store,
+        so future trust adjustments only need to edit `meta["score"]` and re-run.
         """
         analysis = self.analyze_sources()
         updates = []
@@ -273,7 +274,9 @@ class Figtree:
             self.figments[fid] = trust_fig
             updates.append({"source_id": src, "trust": info["adjusted_trust"], **info})
 
-            if output_dir is not None:
+            if store is not None:
+                store.upsert_one(trust_fig)
+            elif output_dir is not None:
                 out = Path(output_dir) / src
                 out.mkdir(parents=True, exist_ok=True)
                 trust_fig.save(out)

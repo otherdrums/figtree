@@ -21,10 +21,12 @@ from rich.table import Table
 from figtree.figment import Figment
 from figtree.generate import FigmentGenerator
 from figtree.graph import Figtree
+from figtree.lancedb_store import connect
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
 FIGMENTS_DIR = Path(__file__).parent / "davos_figments_v2"
+STORE_URI = os.environ.get("FIGTREE_STORE_URI", str(FIGMENTS_DIR) + ".lance")
 
 SOURCES = {
     "pro_globalist": {"name": "Reuters-style", "trust": 0.95, "color": "green"},
@@ -46,12 +48,8 @@ def load_model():
 
 
 def load_all_figments() -> list[Figment]:
-    figments = []
-    for key in SOURCES:
-        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-        for d in figment_dirs:
-            figments.append(Figment.load(d))
-    return figments
+    store = connect(STORE_URI)
+    return store.all()
 
 
 def retrieve_figments(query: str, figments: list[Figment], limit: int = 10) -> list[Figment]:
@@ -69,8 +67,15 @@ def retrieve_figments(query: str, figments: list[Figment], limit: int = 10) -> l
 
 
 def main():
-    if not FIGMENTS_DIR.exists() or not any(FIGMENTS_DIR.iterdir()):
-        console.print("[bold red]Error:[/bold red] No ingested figments found.")
+    store = connect(STORE_URI)
+    try:
+        if store.count() == 0:
+            console.print("[bold red]Error:[/bold red] No ingested figments found.")
+            console.print("Run: python3 run_davos_v2.py ingest")
+            sys.exit(1)
+    except Exception:
+        console.print("[bold red]Error:[/bold red] Could not open store at "
+                      f"{STORE_URI}.")
         console.print("Run: python3 run_davos_v2.py ingest")
         sys.exit(1)
 
@@ -79,8 +84,9 @@ def main():
     model, tokenizer = load_model()
     gen = FigmentGenerator(model, tokenizer)
     all_figments = load_all_figments()
-    graph = Figtree(all_figments)
-    graph.propagate_trust()
+    store = connect(STORE_URI)
+    graph = Figtree(all_figments, store=store)
+    graph.propagate_trust(store=store)
 
     console.print(f"Ready. {len(all_figments)} figments loaded. Type /help for commands.\n")
 
@@ -109,9 +115,10 @@ def main():
             console.print(table)
             continue
         elif query == "/sources":
+            store = connect(STORE_URI)
             for key in SOURCES:
-                dirs = list((FIGMENTS_DIR / key).glob("*.figment"))
-                atomic = [Figment.load(d) for d in dirs if not Figment.load(d).is_image() and not Figment.load(d).is_trust_assertion()]
+                atomic = [f for f in store.by_source(key)
+                          if not f.is_image() and not f.is_trust_assertion()]
                 console.print(f"  {key}: {len(atomic)} figments")
             continue
         elif query.startswith("/figments "):
@@ -119,9 +126,8 @@ def main():
             if key not in SOURCES:
                 console.print(f"[red]Unknown: {key}[/red]")
                 continue
-            dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-            for i, d in enumerate(dirs, 1):
-                f = Figment.load(d)
+            store = connect(STORE_URI)
+            for i, f in enumerate(store.by_source(key), 1):
                 if not f.is_image() and not f.is_trust_assertion():
                     console.print(f"  {i}. {f.text}")
             continue

@@ -1,8 +1,8 @@
 # FigTree — coherent context images from a single primitive
 
-**Everything is a Figment.** There is no database. There is no graph store.
-There is no separate KV cache layer. There is one type — the **Figment** — and
-every operation in the system produces, transforms, or retrieves figments.
+**Everything is a Figment.** There is one type — the **Figment** — and every
+operation in the system produces, transforms, or retrieves figments. Figments are
+persisted in a LanceDB table (with K/V caches held externally as quantized blobs).
 
 ## What is a Figment?
 
@@ -14,11 +14,12 @@ needed to recall, verify, and relate it within a language model's latent space:
 | `text.txt` | ~100 B | Natural language statement — the human-readable payload |
 | `boundary.npy` | ~10 KB | Single hidden-state vector at the **crystal layer**, used for similarity search and deduplication |
 | `boundaries.npy` | ~360 KB | Per-layer hidden states (all layers), used for boundary projection and cross-layer analysis |
-| `kv_cache.npy` | ~2.8 MB | Pre-computed unrotated K/V for every token at every layer — enables generation without a forward pass |
-| `manifest.json` | ~200 B | Metadata: children, sources, trust score, edge type |
+| `kv_cache` | ~2.8 MB | Pre-computed unrotated K/V for every token at every layer (held externally as a quantized blob) — enables generation without a forward pass |
+| `manifest` | ~200 B | Metadata: children, sources, trust score, edge type |
 
-A Figment is stored as a **`.figment/` directory** on disk — a directory is the
-unit of persistence. This is not a file format; it is a filesystem primitive.
+A Figment persists as a **row in a LanceDB table** — the table is the unit of
+storage, with vector columns for similarity search and compressed columns for
+text/metadata. K/V caches live outside the row, addressed by `kv_uri`.
 
 ### What can be a Figment?
 
@@ -82,13 +83,15 @@ python3 examples/davos_benchmark_v2.py
 python3 examples/run_davos_v2.py all
 ```
 
-Three conflicting news narratives are ingested with boundary + KV capture
-(~10 KB boundary + ~2.8 MB KV per figment). Generation uses cached K/V:
+Three conflicting news narratives are ingested into a **LanceDB store** with
+boundary capture (~10 KB boundary + compressed text/metadata per figment).
+K/V caches are external quantized blobs (lazy by default, eager with
+`--compute-kv`):
 
 ```
-Text → sentence splitting → boundary + KV capture → .figment directory
+Text → sentence splitting → boundary capture → LanceDB store (compressed)
   ↓
-Query → retrieve figments → load KV cache → apply RoPE → generate
+Query → ANN retrieve by boundary → KVCacheManager (lazy recompute or blob) → generate
 ```
 
 **Results** (Qwen3-4B on Quadro T1000, 3GB; times vary with context length):
@@ -110,10 +113,12 @@ trade-off, not a fixed speedup.
 
 ```
 figtree/
-├── figment.py       # Figment dataclass — universal primitive + save/load
-├── ingest.py        # Text → figments with boundary + kv_cache capture
+├── figment.py       # Figment dataclass — universal primitive + to/from records
+├── ingest.py        # Text → figments with boundary + optional K/V capture
 ├── generate.py      # Text-based and boundary-based generation
 ├── graph.py         # Edges/trust as figments + source-based credibility
+├── lancedb_store.py # LanceDB store (compression + object storage)
+├── kv_cache_manager.py # K/V materialization: lazy/eager, quantized, tiered
 └── kernel/          # CUDA kernels
     ├── boundary_project.cu    # Boundary → K/V projection (CUDA)
     ├── boundary_project.py    # Python wrapper (handles 4-bit models)
@@ -121,17 +126,23 @@ figtree/
     └── build.py               # Compilation script
 ```
 
-### Figment Format (.figment)
+### Figment Storage (LanceDB)
 
-```
-figment.figment/
-├── manifest.json     # figment_id, children, meta, sources, trust, edge_type
-├── boundary.npy      # (hidden_size,) float32 — ~10 KB
-├── boundary_emb.npy  # (hidden_size,) float32 — last-token embedding
-├── boundaries.npy    # (num_layers, hidden_size) float32 — per-layer states
-├── kv_cache.npy      # (num_layers, seq_len, 2, kv_dim) float32 — ~2.8 MB
-└── text.txt          # Natural language statement
-```
+Figments live in a **LanceDB table** (local path or `s3://`/`gs://`/`az://`). The
+row is lightweight and compressed; K/V lives outside the row as a quantized
+blob addressed by `kv_uri`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `figment_id` | str (pk) | SHA-256(text)[:16] (or deterministic id for trust) |
+| `text` | str | zstd-compressed |
+| `source_id` / `edge_type` | str | lz4 hot columns |
+| `trust` / `is_image` | float / bool | |
+| `has_kv_cache` / `kv_uri` | bool / str | K/V blob pointer (external) |
+| `children` / `sources` | list[str] | |
+| `meta_json` | str (JSON) | zstd-compressed metadata |
+| `boundary` | vector(hidden) | for ANN similarity search |
+| `boundaries` / `boundary_emb` | list[float] | per-layer states / last-token emb |
 
 ## Model
 
@@ -148,7 +159,9 @@ Text is split into sentences. For each sentence:
 2. Capture boundary = hidden state of last token at crystal layer
 3. For each layer, capture input hidden state, apply `input_layernorm`,
    project through `k_proj`/`v_proj` with `k_norm`, store unrotated K/V
-4. Save as `.figment`: boundary.npy + text.txt + manifest.json + kv_cache.npy
+4. Upsert into the LanceDB store (`lancedb_store.connect(uri)`) with
+   compression. K/V is external: lazy by default, or persisted as a quantized
+   blob via `KVCacheManager` when `compute_kv=True`.
 
 ### 2. Generation (`figtree/generate.py`)
 
@@ -158,9 +171,10 @@ Text is split into sentences. For each sentence:
 2. Forward through all 36 layers with DynamicCache
 3. Figment KV entries populate the cache
 
-**Boundary-based** (load cached K/V from disk, skips per-figment forward pass):
+**Boundary-based** (lazy K/V via `KVCacheManager`, skips per-figment forward pass):
 
-1. Load `kv_cache.npy` for each figment
+1. `kv_manager.materialize(figments)` returns per-figment K/V (recomputed on
+   demand, or loaded from the `kv_uri` blob if persisted eagerly)
 2. Apply RoPE based on global position IDs
 3. Insert into DynamicCache directly — no forward pass
 

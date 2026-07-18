@@ -2,12 +2,15 @@ __pycache__/
 *.py[cod]
 *.so
 .venv/
+.venv_f39/
 *.egg-info/
 dist/
 build/
 .ruff_cache/
 .pytest_cache/
 *.figment/
+*.lance/
+figtree_kv/
 deltas/
 !temp_deltas/
 *.gguf

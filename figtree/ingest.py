@@ -141,19 +141,30 @@ def ingest_text_to_figments(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     text: str,
-    output_dir: Path,
+    output_dir: Path | str | None = None,
     source_id: str = "",
     trust: float = 0.5,
     crystal_layer: int | None = None,
     min_chars: int = 20,
+    store=None,
+    kv_manager=None,
+    compute_kv: bool = False,
 ) -> list[Figment]:
-    """Ingest text into atomic figments with boundary + kv_cache capture.
+    """Ingest text into atomic figments with boundary + (optional) K/V capture.
 
-    Returns list of Figments: [image, sentence_1, sentence_2, ..., trust_assertion]
+    Storage is LanceDB-backed when ``store`` is provided (recommended). When
+    ``store`` is omitted, figments are still returned in memory and (for backward
+    compatibility) written as ``.figment/`` directories under ``output_dir``.
+
+    K/V caching: by default (``compute_kv=False``) no K/V blob is persisted
+    (lazy mode — recomputed on demand by ``KVCacheManager``). Set
+    ``compute_kv=True`` (and pass a ``kv_manager``) to eagerly persist quantized
+    K/V blobs and record ``kv_uri`` on each figment.
     """
     device = model.device
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     if crystal_layer is None:
         crystal_layer = detect_crystal_layer(model, tokenizer)
@@ -229,21 +240,21 @@ def ingest_text_to_figments(
             for li in range(1, num_layers):
                 layer_inputs.append(layer_outputs[li - 1][0])
 
-            # Precompute K/V for every token at every layer across the whole stream.
-            full_kv: list[torch.Tensor] = []  # list over layers of (seq_len_total, 2, kv_dim)
-            for li in range(num_layers):
-                k, v = _project_kv(layer_inputs[li], model.model.layers[li], num_kv_heads, head_dim, use_kernel)
-                k = k.reshape(seq_len_total, kv_dim)
-                v = v.reshape(seq_len_total, kv_dim)
-                full_kv.append(torch.stack([k, v], dim=1).float().cpu())
+            # Precompute K/V for every token at every layer across the whole
+            # stream ONLY when eagerly persisting K/V caches. In lazy mode the
+            # KVCacheManager recomputes on demand, so we skip this cost here.
+            full_kv: list[torch.Tensor] | None = None
+            if compute_kv:
+                full_kv = []  # list over layers of (seq_len_total, 2, kv_dim)
+                for li in range(num_layers):
+                    k, v = _project_kv(layer_inputs[li], model.model.layers[li], num_kv_heads, head_dim, use_kernel)
+                    k = k.reshape(seq_len_total, kv_dim)
+                    v = v.reshape(seq_len_total, kv_dim)
+                    full_kv.append(torch.stack([k, v], dim=1).float().cpu())
 
             for si, (sent, (start, end)) in enumerate(zip(kept_sentences, spans)):
                 if end <= start:
                     continue
-                # Per-figment K/V slice for all layers (includes trailing separator).
-                kv_cache_list = [full_kv[li][start:end] for li in range(num_layers)]
-                kv_cache_t = torch.stack(kv_cache_list).numpy()
-
                 # Last real token of this sentence (exclude trailing separator if any).
                 last_tok = end - 1
                 if si + 1 < len(starts):
@@ -266,8 +277,20 @@ def ingest_text_to_figments(
                 )
                 sentence_figments.append(figment)
 
-                figment_dir = figment.save(output_dir)
-                np.save(figment_dir / "kv_cache.npy", kv_cache_t)
+                # Persist per-figment K/V slice when eagerly caching.
+                if compute_kv and full_kv is not None:
+                    kv_cache_list = [full_kv[li][start:end] for li in range(num_layers)]
+                    kv_cache_t = torch.stack(kv_cache_list).numpy()
+                    if kv_manager is not None:
+                        uri = kv_manager._blob_uri(figment.figment_id)  # noqa: SLF001
+                        qkv, qmeta = kv_manager._quantize(kv_cache_t)  # noqa: SLF001
+                        kv_manager._write_blob(uri, qkv, qmeta)  # noqa: SLF001
+                        figment.meta["kv_uri"] = uri
+                        figment.meta["has_kv_cache"] = True
+                    elif output_dir is not None:
+                        # Backward-compat: write kv_cache.npy next to figment dir.
+                        figment_dir = figment.save(output_dir)
+                        np.save(figment_dir / "kv_cache.npy", kv_cache_t)
 
             layer_outputs.clear()
 
@@ -294,8 +317,16 @@ def ingest_text_to_figments(
         sources=[image.figment_id],
     )
 
-    image.save(output_dir)
-    trust_figment.save(output_dir)
-
     all_figments = [image] + sentence_figments + [trust_figment]
+
+    if store is not None:
+        hidden = image.boundary.shape[0]
+        # Upsert in deterministic id order so trust/image overwrite cleanly.
+        store.upsert(all_figments, hidden_size=hidden)
+    elif output_dir is not None:
+        image.save(output_dir)
+        trust_figment.save(output_dir)
+        for f in sentence_figments:
+            f.save(output_dir)
+
     return all_figments

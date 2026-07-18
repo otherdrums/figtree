@@ -35,13 +35,15 @@ python3 examples/davos_benchmark_v2.py
 
 ```
 figtree/
-├── figment.py          # Figment dataclass + save/load
-├── ingest.py           # Text → figments with boundary + kv_cache capture
+├── figment.py          # Figment dataclass + to/from records
+├── ingest.py           # Text → figments with boundary + optional K/V capture
 ├── generate.py         # On-the-fly KV + cached boundary KV generation
-├── graph.py            # Edges/trust as figments + dedup
+├── graph.py            # Edges/trust as figments + source-based credibility
+├── lancedb_store.py    # LanceDB store (compression + object storage)
+├── kv_cache_manager.py # K/V materialization: lazy/eager, quantized, tiered
 └── kernel/
     ├── boundary_project.cu   # CUDA kernel: boundaries @ W_k/W_v
-    ├── boundary_project.py   # Python wrapper
+    ├── boundary_project.py   # Python wrapper (4-bit dequant)
     └── build.py              # torch.utils.cpp_extension.load
 ```
 
@@ -106,8 +108,11 @@ For each sentence:
 2. Capture boundary = hidden state of LAST token at crystal_layer
 3. Compute per-token per-layer K/V (unrotated) by projecting each layer's
    normed input through W_k/W_v with k_norm
-4. Save as `.figment` directory: `boundary.npy` + `text.txt` + `manifest.json`
-   + `kv_cache.npy` (per-token unrotated K/V)
+4. Upsert figments into a **LanceDB store** (`lancedb_store.connect(uri)`)
+   with compression (zstd text/metadata, lz4 hot cols, auto dictionary/FSST).
+   K/V is NOT stored in the row by default (lazy); set `compute_kv=True`
+   (or `--compute-kv`) to also persist quantized K/V blobs via the
+   `KVCacheManager` (external files / object storage).
 
 ### Generation Engine
 
@@ -123,12 +128,12 @@ result = gen.generate(
     max_new_tokens=100,
 )
 
-# Boundary-based generation (load cached K/V from disk)
+# Boundary-based generation (lazy K/V via KVCacheManager; recomputes on demand)
 result = gen.generate_from_boundaries(
     figments=[fig1, fig2, fig3],
     prompt="What happened at Davos?",
     max_new_tokens=100,
-    cache_dir="./figments",
+    kv_manager=kv_manager,
 )
 ```
 
@@ -154,16 +159,55 @@ Both `generate` and `generate_from_boundaries` wrap the prompt in the Qwen3 Chat
 ```python
 from figtree.graph import Figtree
 
-graph = Figtree(all_figments)
+graph = Figtree(all_figments, store=store)
 graph.deduplicate()            # exact + semantic boundary similarity
 graph.create_edges()           # SUPPORTS, SAME_ENTITY, CONTRADICTS
-graph.propagate_trust(output_dir=...)  # source-based, idempotent, disk-persisted
+graph.propagate_trust(store=store)  # source-based, idempotent, store-persisted
 ```
 
 All graph operations produce **new Figments**:
 - Deduplication creates `Figment(meta={"edge_type": "supports"})`
 - Trust propagation creates `Figment(meta={"edge_type": "trust", "score": 0.95})`
 - Contradictions create `Figment(meta={"edge_type": "contradicts"})`
+
+### Storage: LanceDB (`figtree/lancedb_store.py`)
+
+Figments are stored in a **LanceDB table**. Benefits:
+
+- **Compression**: `text`/`meta` columns use `zstd`; small/hot string columns
+  (`figment_id`, `source_id`, `edge_type`, `kv_uri`) use `lz4`; Lance applies
+  automatic dictionary/FSST encodings for strings and bit-packing for numerics.
+  A text-heavy 200-row table of ~280 KB raw compresses to ~26 KB on disk.
+- **Remote / object storage**: pass an object-store URI to `connect`
+  (`s3://bucket/path`, `gs://...`, `az://...`) plus `storage_options`
+  (credentials, region, endpoint). Same code path as local.
+- **ANN search**: the `boundary` vector column supports similarity retrieval
+  (`store.search(vector, k=...)`).
+- **Idempotent upsert**: keyed on `figment_id` (delete+add under the hood,
+  because this LanceDB version's `merge_insert`/`update` mishandle vector
+  columns).
+
+Schema fields: `figment_id` (pk), `text`, `source_id`, `edge_type`, `trust`,
+`is_image`, `has_kv_cache`, `kv_uri`, `children`, `sources`, `meta_json`,
+`boundary` (vector), `boundaries`, `boundary_emb`.
+
+### KV Cache Manager (`figtree/kv_cache_manager.py`)
+
+K/V caches (`(num_layers, seq_len, 2, kv_dim)`) are large and variable-shape, so
+they live **outside** the Lance row, addressed by `kv_uri` on the figment:
+
+- **Lazy (default)**: K/V is not persisted at ingest. `materialize()` recomputes
+  it on demand (single concatenated forward pass, same separators as ingest),
+  caches it in an in-memory LRU, and (if eager) writes a quantized blob.
+- **Eager** (`compute_kv=True`): K/V is computed at ingest and written (fp16/int8
+  quantized) to `kv_uri`, recording `has_kv_cache=True` on the figment.
+- **Tiered**: LRU (hot) → external blob at `kv_uri` (warm) → recompute (cold).
+- Blobs are local files by default; `kv_root` may be an `s3://` URI.
+
+## Model
+
+Default: Qwen3-4B (unsloth bnb-4bit, cached at ~/.cache/huggingface/hub/)
+GPU: Quadro T1000 (3GB VRAM)
 
 ## Model
 
@@ -234,7 +278,14 @@ result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB headroom. Works for 300–500 token contexts. For longer contexts, use Qwen3-2B or larger GPU.
 
-3. **kv_cache.npy storage**: ~2.8 MB per 20-token figment. 100 figments = ~280 MB. Manageable on modern drives but not as compact as ~10 KB boundary-only storage.
+3. **kv_cache.npy storage**: ~2.8 MB per 20-token figment, but now lives as an
+   external quantized blob (default lazy — not persisted at ingest). In LanceDB
+   the lightweight row is ~10 KB (boundary + text + metadata, compressed). 100
+   figments ≈ 1 MB in the store; K/V only materializes on demand.
+
+6. **`.figment/` layout superseded**: raw `.figment/` directories are no longer
+   used; all new code reads/writes the LanceDB store. `Figment.save`/`Figment.load`
+   are retained only for ad-hoc debugging.
 
 4. **Per-source recall is verbatim-grounded; cross-source synthesis is model-generated**. QUERY 1/4 (per-source) reproduce each narrative's figures faithfully. The trust-aware QUERY 2/3 synthesize across sources via the LLM; to avoid fabricated agreement the demo grounds the prompt with `analyze_sources` relationships (`related`/`agreeing`/`contradicting`) and instructs the model to only state facts present in ≥2 source texts. Even so, the small model can under-describe disagreements.
 
@@ -244,5 +295,9 @@ result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
 
 - Each source has an **immutable** `base_trust` stored on its image figment's `meta["base_trust"]` at ingest. Persisted `trust:{source_id}` figments carry the *adjusted* score and are never read back as base (prevents trust drift across reloads).
 - `Figtree.analyze_sources()` returns, per source: `related` (topic overlap), `agreeing` (same explicit non-neutral stance), `contradicting` (opposite stance), `corroborated_frac`, and `adjusted_trust = min(1, max(0, 0.6·base + 0.4·corroborated)) × 0.85 if contradicted`.
-- `Figtree.propagate_trust(output_dir=...)` is **idempotent and disk-persistent**: it (re)creates one trust figment per source with a deterministic id (`trust:{source_id}`), overwriting the previous file. A future "accuracy proven → trust up" step only edits `meta["score"]` on that figment and re-runs `propagate_trust`. No schema change.
+- `Figtree.propagate_trust(store=...)` is **idempotent and store-persistent**: it
+  (re)creates one trust figment per source with a deterministic id
+  (`trust:{source_id}`) in the LanceDB store, overwriting the previous row. A
+  future "accuracy proven → trust up" step only edits `meta["score"]` on that
+  figment and re-runs `propagate_trust`. No schema change.
 - `Figtree.build_trust_aware_context(query)` recalls every perspective relevant to a query with its credibility relationships; the demo injects these into the generation prompt so cross-source claims are grounded in the actual texts.

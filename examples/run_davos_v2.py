@@ -52,9 +52,13 @@ def do_ingest():
     console.print("[bold]GPU:[/bold] " +
                   (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"))
 
-    if FIGMENTS_DIR.exists():
-        shutil.rmtree(FIGMENTS_DIR)
-    FIGMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    store_uri = os.environ.get("FIGTREE_STORE_URI", str(FIGMENTS_DIR) + ".lance")
+    compute_kv = os.environ.get("FIGTREE_COMPUTE_KV", "0") == "1"
+    console.print(f"[bold]Store:[/bold] {store_uri}  [bold]compute_kv:[/bold] {compute_kv}")
+
+    if Path(store_uri).exists():
+        shutil.rmtree(store_uri)
+    Path(store_uri).parent.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(
@@ -67,6 +71,15 @@ def do_ingest():
     console.print("  Loaded: {} layers, h={}".format(
         model.config.num_hidden_layers, model.config.hidden_size))
 
+    from figtree.lancedb_store import connect
+    from figtree.kv_cache_manager import KVCacheManager
+
+    store = connect(store_uri)
+    kv_manager = KVCacheManager(
+        model, tokenizer, kv_root=str(Path(store_uri).with_suffix("")) + "_kv",
+        mode="eager" if compute_kv else "lazy",
+    )
+
     banner("Ingesting...", "Boundary capture per sentence (~10 KB/figment)")
 
     for key in SOURCES:
@@ -77,12 +90,12 @@ def do_ingest():
 
         figments = ingest_text_to_figments(
             model=model, tokenizer=tokenizer, text=text,
-            output_dir=FIGMENTS_DIR / key, source_id=key,
+            output_dir=None, source_id=key, store=store,
+            kv_manager=kv_manager, compute_kv=compute_kv,
             trust=source["trust"], min_chars=20,
         )
 
-        total_size = sum(f.stat().st_size for f in (FIGMENTS_DIR / key).rglob("*") if f.is_file())
-        console.print(f"    {len(figments)} figments, {total_size / 1024:.1f} KB total")
+        console.print(f"    {len(figments)} figments persisted to {store_uri}")
 
     console.print("\n[bold green]Ingestion complete.[/bold green] Run: python3 run_davos_v2.py generate")
 
@@ -110,6 +123,17 @@ def do_generate():
 
     gen = FigmentGenerator(model, tokenizer)
 
+    store_uri = os.environ.get("FIGTREE_STORE_URI", str(FIGMENTS_DIR) + ".lance")
+    compute_kv = os.environ.get("FIGTREE_COMPUTE_KV", "0") == "1"
+    from figtree.lancedb_store import connect
+    from figtree.kv_cache_manager import KVCacheManager
+
+    store = connect(store_uri)
+    kv_manager = KVCacheManager(
+        model, tokenizer, kv_root=str(Path(store_uri).with_suffix("")) + "_kv",
+        mode="eager" if compute_kv else "lazy",
+    )
+
     # -- Source narratives --
     banner("Input Narratives", "Full source texts used in this run")
     source_texts = {}
@@ -121,11 +145,10 @@ def do_generate():
         console.print(f"\n[bold {color}]── {key} ({source['name']}, trust={source['trust']}) ──[/bold {color}]")
         console.print(text)
 
-    # -- Load figments --
+    # -- Load figments from the LanceDB store --
     source_figments: dict[str, list[Figment]] = {}
     for key in SOURCES:
-        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-        figments = [Figment.load(d) for d in figment_dirs]
+        figments = store.by_source(key)
         atomic = [f for f in figments if not f.is_image() and not f.is_trust_assertion()]
         source_figments[key] = atomic
 
@@ -196,7 +219,7 @@ def do_generate():
         try:
             result_bd = gen.generate_from_boundaries(
                 figments=figments, prompt="What happened at Davos? Recount the key details, figures, and claims from this source's narrative.",
-                max_new_tokens=400, cache_dir=str(FIGMENTS_DIR / key),
+                max_new_tokens=400, kv_manager=kv_manager,
             )
             console.print(f"\n[bold]Output ({result_bd['num_tokens']} tokens, {result_bd['elapsed']:.1f}s):[/bold]")
             console.print(result_bd["generated_text"])
@@ -215,14 +238,13 @@ def do_generate():
 def _build_graph() -> "Figtree":
     """Load all ingested figments and compute (persisted) source-based trust."""
     from figtree.graph import Figtree
+    from figtree.lancedb_store import connect
 
-    all_figments = []
-    for key in SOURCES:
-        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-        for d in figment_dirs:
-            all_figments.append(Figment.load(d))
-    graph = Figtree(all_figments)
-    graph.propagate_trust(output_dir=FIGMENTS_DIR)  # idempotent, disk-persisted
+    store_uri = os.environ.get("FIGTREE_STORE_URI", str(FIGMENTS_DIR) + ".lance")
+    store = connect(store_uri)
+    all_figments = store.all()
+    graph = Figtree(all_figments, store=store)
+    graph.propagate_trust(store=store)  # idempotent, store-persisted
     return graph
 
 
@@ -321,17 +343,16 @@ def do_graph():
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = Path(__file__).parent / f"davos_graph_{run_ts}.log"
 
-    all_figments = []
-    for key in SOURCES:
-        figment_dirs = sorted((FIGMENTS_DIR / key).glob("*.figment"))
-        for d in figment_dirs:
-            all_figments.append(Figment.load(d))
+    store_uri = os.environ.get("FIGTREE_STORE_URI", str(FIGMENTS_DIR) + ".lance")
+    from figtree.lancedb_store import connect
+    store = connect(store_uri)
+    all_figments = store.all()
 
-    graph = Figtree(all_figments)
+    graph = Figtree(all_figments, store=store)
 
     dedup_edges = graph.deduplicate()
     auto_edges = graph.create_edges()
-    trust_scores = graph.propagate_trust(output_dir=FIGMENTS_DIR)  # idempotent + persisted
+    trust_scores = graph.propagate_trust(store=store)  # idempotent + persisted
 
     console.print(f"  Figments: {len([f for f in all_figments if not f.is_edge() and not f.is_trust_assertion()])}")
     console.print(f"  Dedup edges: {len(dedup_edges)}")

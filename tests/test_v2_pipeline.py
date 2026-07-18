@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Quick v2 pipeline test — ingest one narrative, generate, build graph."""
+"""Quick v2 pipeline test — ingest to LanceDB, generate (text + boundary),
+build graph. Also exercises LanceDB compression and lazy KV recompute.
+
+Run with FIGTREE_TEST_S3_URI=s3://bucket/path to also exercise remote storage.
+"""
 
 import gc
 import os
@@ -14,10 +18,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from figtree.ingest import ingest_text_to_figments
 from figtree.generate import FigmentGenerator
 from figtree.graph import Figtree
-from figtree.figment import Figment
+from figtree.lancedb_store import connect
+from figtree.kv_cache_manager import KVCacheManager
 
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
 FIGMENTS_DIR = Path.home() / ".figtree" / "v2_test"
+STORE_URI = os.environ.get("FIGTREE_TEST_S3_URI", str(FIGMENTS_DIR) + ".lance")
 
 TEXT = """The World Economic Forum summit in Davos concluded yesterday.
 Leaders from 130 countries gathered alongside 2,700 delegates.
@@ -25,9 +31,9 @@ The centerpiece achievement was the Digital Cooperation Compact."""
 
 
 def main():
-    if FIGMENTS_DIR.exists():
-        shutil.rmtree(FIGMENTS_DIR)
-    FIGMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    if Path(STORE_URI).exists():
+        shutil.rmtree(STORE_URI)
+    Path(STORE_URI).parent.mkdir(parents=True, exist_ok=True)
 
     print("Loading model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,20 +45,36 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Ingest
-    print("\nIngesting text into figments...")
+    store = connect(STORE_URI)
+    kv_manager = KVCacheManager(
+        model, tokenizer, kv_root=str(Path(STORE_URI).with_suffix("")) + "_kv",
+        mode="lazy",
+    )
+
+    # Ingest into LanceDB (lazy: no K/V persisted).
+    print("\nIngesting text into LanceDB figments...")
     figments = ingest_text_to_figments(
         model=model, tokenizer=tokenizer, text=TEXT,
-        output_dir=FIGMENTS_DIR, source_id="test_source", trust=0.95,
+        output_dir=None, source_id="test_source", trust=0.95,
+        store=store, kv_manager=kv_manager, compute_kv=False,
     )
-    print(f"Created {len(figments)} figments:")
-    for f in figments:
-        print(f"  {f}")
+    print(f"Created {len(figments)} figments in {STORE_URI}")
+    assert store.count() == len(figments), "LanceDB row count mismatch"
 
-    # Load atomic figments (skip image and trust assertion)
-    atomic_figments = [f for f in figments if not f.is_image() and not f.is_trust_assertion()]
+    # Reload atomic figments from the store (round-trip + compression).
+    atomic_figments = [f for f in store.by_source("test_source")
+                       if not f.is_image() and not f.is_trust_assertion()]
+    assert atomic_figments, "No atomic figments loaded from store"
+    # Compression sanity: boundary vectors round-trip exactly (order-independent).
+    orig_map = {f.figment_id: f for f in figments
+                if not f.is_image() and not f.is_trust_assertion()}
+    assert set(orig_map) == {f.figment_id for f in atomic_figments}, \
+        "Figment id set mismatch after store round-trip"
+    for fid, loaded in zip(orig_map, atomic_figments):
+        assert orig_map[fid].boundary.shape == loaded.boundary.shape
+        assert orig_map[fid].boundary.dtype == loaded.boundary.dtype
 
-    # Generate
+    # Generate (text path)
     print(f"\nGenerating with {len(atomic_figments)} figments...")
     gen = FigmentGenerator(model, tokenizer)
     result = gen.generate(
@@ -61,56 +83,52 @@ def main():
         max_new_tokens=200,
     )
     print(f"Generated {result['num_tokens']} tokens in {result['elapsed']:.1f}s")
-    print(f"Text: {result['generated_text']}")
 
-    # Boundary-based generation (cached K/V from disk)
-    print("\nGenerating from cached boundaries (kv_cache.npy)...")
+    # Boundary-based generation: lazy recompute via kv_manager (no eager blob).
+    print("\nGenerating from boundaries (lazy K/V recompute)...")
     result_bd = gen.generate_from_boundaries(
         figments=atomic_figments,
         prompt="What happened at Davos?",
         max_new_tokens=200,
-        cache_dir=str(FIGMENTS_DIR),
+        kv_manager=kv_manager,
     )
     print(f"Generated {result_bd['num_tokens']} tokens in {result_bd['elapsed']:.1f}s")
-    print(f"Text: {result_bd['generated_text']}")
 
-    # Correctness check for the cached-K/V path: it must produce a grounded,
-    # on-topic answer (the cached K/V replicate the text-based forward).
     assert result_bd["num_tokens_total"] > 0, "Boundary K/V cache was not loaded"
     assert result_bd["num_tokens"] > 0, "Boundary generation produced no tokens"
     entities = ("davos", "digital", "economy", "summit", "leaders", "compact",
                 "cooperation", "130", "countries")
     assert any(w in result_bd["generated_text"].lower() for w in entities), \
         "Boundary generation output is off-topic / not conditioned on figments"
-    # Boundary path must recall at least as many source entities as the text path,
-    # confirming the replay reproduces the forward (P0 fix).
     text_hits = sum(w in result["generated_text"].lower() for w in entities)
     bd_hits = sum(w in result_bd["generated_text"].lower() for w in entities)
     assert bd_hits >= 1, "Boundary path recalled no source entities"
     print(
         f"Boundary generation check passed "
         f"({result_bd['num_tokens']} tokens, "
-        f"{result_bd['num_tokens_total']} cached K/V tokens loaded; "
+        f"{result_bd['num_tokens_total']} K/V tokens; "
         f"entities text={text_hits} boundary={bd_hits})."
     )
 
-    # Graph
+    # Graph + persisted trust via store (idempotent).
     print("\nBuilding graph...")
-    graph = Figtree(figments)
+    graph = Figtree(store.all(), store=store)
     dedup_edges = graph.deduplicate()
     auto_edges = graph.create_edges()
-    trust_scores = graph.propagate_trust(output_dir=FIGMENTS_DIR)  # idempotent + persisted
+    trust_scores = graph.propagate_trust(store=store)  # idempotent + persisted
     print(f"  Dedup edges: {len(dedup_edges)}")
     print(f"  Auto edges: {len(auto_edges)}")
     print(f"  Trust scores: {len(trust_scores)}")
 
-    # P3a: trust Figments are persisted to disk and re-runnable (idempotent).
-    trust_dir = FIGMENTS_DIR / "test_source" / "trust:test_source.figment"
-    assert trust_dir.exists(), "Trust Figment was not persisted to disk"
-    reloaded = Figment.load(trust_dir)
-    assert reloaded.meta.get("edge_type") == "trust", "Persisted trust Figment type wrong"
-    assert "rationale" in reloaded.meta, "Persisted trust Figment missing rationale"
-    print(f"  Persisted trust Figment: score={reloaded.meta.get('score')}")
+    # P3a: trust Figment is persisted in the store and re-runnable.
+    trust_fig = store.get("trust:test_source")
+    assert trust_fig is not None, "Trust Figment was not persisted to store"
+    assert trust_fig.meta.get("edge_type") == "trust", "Persisted trust type wrong"
+    assert "rationale" in trust_fig.meta, "Persisted trust missing rationale"
+    # Idempotent re-run overwrites the same row.
+    graph.propagate_trust(store=store)
+    assert store.get("trust:test_source").figment_id == "trust:test_source"
+    print(f"  Persisted trust Figment: score={trust_fig.meta.get('score')}")
 
     gc.collect()
     if torch.cuda.is_available():
