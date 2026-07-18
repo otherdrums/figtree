@@ -100,15 +100,25 @@ class Figtree:
     def analyze_sources(self) -> dict[str, dict]:
         """Compute per-source corroboration/contradiction.
 
+        Distinguishes three kinds of cross-source relationship:
+        - ``related``: sources discuss the same entities (topic overlap) — neutral;
+          this is NOT a claim of agreement.
+        - ``agreeing``: same entities AND both sources carry the *same explicit
+          non-neutral* sentiment cue (both positive => shared endorsement; both
+          negative => shared criticism). Genuine alignment only.
+        - ``contradicting``: same entities AND opposite sentiment cues.
+
         Returns source_id -> {
-            "base_trust", "corroborating": [sources], "contradicting": [sources],
-            "corroborated_frac", "adjusted_trust", "rationale": str
+            "base_trust", "related": [sources], "agreeing": [sources],
+            "contradicting": [sources], "corroborated_frac",
+            "adjusted_trust", "rationale": str
         }
         """
         base = self._source_base_trust()
         sources = list(self.by_source.keys())
 
-        corroborating: dict[str, set] = defaultdict(set)
+        related: dict[str, set] = defaultdict(set)
+        agreeing: dict[str, set] = defaultdict(set)
         contradicting: dict[str, set] = defaultdict(set)
         fig_corroborated: dict[str, bool] = {}
 
@@ -121,13 +131,18 @@ class Figtree:
                         shared = self._entities(fa) & self._entities(fb)
                         if not shared:
                             continue
+                        related[a].add(b)
+                        related[b].add(a)
                         cue_a, cue_b = self._cue(fa), self._cue(fb)
                         if cue_a != cue_b and "neutral" not in (cue_a, cue_b):
+                            # Opposite explicit sentiment => contradiction.
                             contradicting[a].add(b)
                             contradicting[b].add(a)
-                        else:
-                            corroborating[a].add(b)
-                            corroborating[b].add(a)
+                        elif cue_a == cue_b and cue_a != "neutral":
+                            # Both share the same explicit (pos/neg) stance =>
+                            # genuine alignment on that point.
+                            agreeing[a].add(b)
+                            agreeing[b].add(a)
                             fig_corroborated[fa.figment_id] = True
                             fig_corroborated[fb.figment_id] = True
 
@@ -141,14 +156,15 @@ class Figtree:
                 adj *= 0.85
             adj = float(min(1.0, max(0.0, adj)))
             rationale = (
-                f"base_trust={b_trust:.2f}, shares claims with "
-                f"{sorted(corroborating[s]) or 'none'} "
-                f"({corr * 100:.0f}% of claims), "
-                f"contradicted by {sorted(contradicting[s]) or 'none'}"
+                f"base_trust={b_trust:.2f}, related to {sorted(related[s]) or 'none'} "
+                f"(topic overlap), agrees with {sorted(agreeing[s]) or 'none'}, "
+                f"contradicted by {sorted(contradicting[s]) or 'none'} "
+                f"({corr * 100:.0f}% of its claims corroborated)"
             )
             result[s] = {
                 "base_trust": b_trust,
-                "corroborating": sorted(corroborating[s]),
+                "related": sorted(related[s]),
+                "agreeing": sorted(agreeing[s]),
                 "contradicting": sorted(contradicting[s]),
                 "corroborated_frac": corr,
                 "adjusted_trust": adj,
@@ -243,7 +259,8 @@ class Figtree:
                     "source_id": src,
                     "score": info["adjusted_trust"],
                     "base_trust": info["base_trust"],
-                    "corroborating": info["corroborating"],
+                    "related": info["related"],
+                    "agreeing": info["agreeing"],
                     "contradicting": info["contradicting"],
                     "corroborated_frac": info["corroborated_frac"],
                     "rationale": info["rationale"],
@@ -270,7 +287,11 @@ class Figtree:
         """Recall all perspectives relevant to `query`, with credibility notes.
 
         Returns {
-            "query", "by_source": {src: {"trust", "figments", "rationale"}},
+            "query",
+            "by_source": {src: {
+                "trust", "rationale", "figments",
+                "related", "agreeing", "contradicting"  # source-id lists
+            }},
             "rationale": str,   # synthesized credibility explanation
         }
         """
@@ -294,6 +315,9 @@ class Figtree:
                 "trust": info.get("adjusted_trust", 0.5),
                 "rationale": info.get("rationale", ""),
                 "figments": [],
+                "related": info.get("related", []),
+                "agreeing": info.get("agreeing", []),
+                "contradicting": info.get("contradicting", []),
             })
             by_source[src]["figments"].append(text)
 

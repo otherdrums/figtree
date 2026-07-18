@@ -91,14 +91,20 @@ Text → sentence splitting → boundary + KV capture → .figment directory
 Query → retrieve figments → load KV cache → apply RoPE → generate
 ```
 
-**Results** (Qwen3-4B on Quadro T1000, 3GB):
+**Results** (Qwen3-4B on Quadro T1000, 3GB; times vary with context length):
 
 | Phase | Time | Output |
 |-------|------|--------|
-| Ingestion | 23.4s | 41 figments, 445 KB |
-| Generation | 33.6s | 100 tokens, 35 figments |
-| Graph | 0.0s | 38 figments, 3 edges |
-| **Total** | **57.0s** | |
+| Ingestion | ~18s | ~38 atomic figments, ~2.8 MB KV each |
+| Generation (text-based) | ~50s | 4 sources × 400 tokens |
+| Generation (boundary-based) | ~58s | 4 sources × 400 tokens |
+| Graph | <1s | 3 sources, persisted trust figments |
+| **Total** | **~2 min** | |
+
+The boundary-based path skips the per-figment forward pass by replaying cached
+K/V, but on this small GPU the KV-load + RoPE cost roughly cancels the saving, so
+wall-clock is comparable to text-based generation. The benefit is storage/compute
+trade-off, not a fixed speedup.
 
 ## Architecture
 
@@ -107,10 +113,11 @@ figtree/
 ├── figment.py       # Figment dataclass — universal primitive + save/load
 ├── ingest.py        # Text → figments with boundary + kv_cache capture
 ├── generate.py      # Text-based and boundary-based generation
-├── graph.py         # Edges/trust as figments + dedup
+├── graph.py         # Edges/trust as figments + source-based credibility
 └── kernel/          # CUDA kernels
     ├── boundary_project.cu    # Boundary → K/V projection (CUDA)
-    ├── boundary_project.py    # Python wrapper
+    ├── boundary_project.py    # Python wrapper (handles 4-bit models)
+    ├── prompt.py              # Qwen3 ChatML prompt builder
     └── build.py               # Compilation script
 ```
 
@@ -151,7 +158,7 @@ Text is split into sentences. For each sentence:
 2. Forward through all 36 layers with DynamicCache
 3. Figment KV entries populate the cache
 
-**Boundary-based** (load cached K/V from disk, ~22% faster):
+**Boundary-based** (load cached K/V from disk, skips per-figment forward pass):
 
 1. Load `kv_cache.npy` for each figment
 2. Apply RoPE based on global position IDs
@@ -171,7 +178,9 @@ Text is split into sentences. For each sentence:
 
 ### 3. Boundary Projection (`figtree/kernel/boundary_project.cu`)
 
-Custom CUDA kernel for non-quantized models:
+Custom CUDA kernel (`boundary_project_bf16_kernel`) projects boundary vectors
+through a layer's `W_k` / `W_v`:
+
 ```cuda
 boundary_project_bf16_kernel(
     boundaries,  // (num_figments, hidden_size)
@@ -181,7 +190,41 @@ boundary_project_bf16_kernel(
 )
 ```
 
-For 4-bit quantized models, falls back to PyTorch `matmul`.
+For **4-bit quantized models** (e.g. `unsloth/Qwen3-4B-bnb-4bit`), the Python
+wrapper in `boundary_project.py` **dequantizes** the `bitsandbytes` 4-bit weight
+to bf16 on the fly (contiguous `(hidden, kv_dim)` layout) and runs the same CUDA
+kernel — no PyTorch `matmul` fallback needed. The kernel is only bypassed if it
+fails to build, in which case a PyTorch `matmul` fallback is used.
+
+### 4. Source-based Trust (`figtree/graph.py`)
+
+Trust is **source-based and mutable**, not a fixed graph attribute:
+
+- Each source carries an immutable `base_trust` (set at ingest on the image
+  figment's `meta["base_trust"]`). Persisted `trust:{source_id}` figments carry
+  the *adjusted* score and are never read back as base (this prevents trust drift
+  across reloads).
+- `analyze_sources()` computes, per source: which other sources it is `related`
+  to (topic overlap), `agreeing` with (same explicit non-neutral stance), and
+  `contradicting` (opposite stance). Adjusted trust = `0.6·base + 0.4·corroborated`
+  then ×0.85 if contradicted by others.
+- `propagate_trust(output_dir=...)` is **idempotent and disk-persistent**: it (re)
+  creates one trust figment per source with a deterministic id, overwriting the
+  previous file. A future "accuracy proven → trust up" step only edits
+  `meta["score"]` on that figment and re-runs `propagate_trust`. No schema change.
+- `build_trust_aware_context(query)` recalls every perspective relevant to a query
+  together with its credibility relationships, which the demo injects into the
+  generation prompt so cross-source agreement/disagreement is grounded in the
+  actual source texts (preventing the model from inventing agreement).
+
+### 5. Prompt & decoding details (`figtree/generate.py`, `figtree/kernel/prompt.py`)
+
+- Both generation paths wrap the prompt in the **Qwen3 ChatML template**
+  (`build_prompt_ids`, thinking disabled) so the model produces grounded answers.
+- Figment texts are concatenated with `\n\n` separators during ingestion; the
+  boundary path replays the exact same per-figment K/V slices, so
+  boundary-based output matches text-based output token-for-token in content.
+- A `repetition_penalty` (1.15) is applied during sampling to reduce looping.
 
 ## Critical Technical Details
 

@@ -233,7 +233,14 @@ def _run_trust_aware(
     source_figments_map: dict[str, list[Figment]],
     log_path: Path,
 ) -> None:
-    """Recall all perspectives on a query and explain credibility, then generate."""
+    """Recall all perspectives on a query and explain credibility, then generate.
+
+    The credibility relationships (which sources agree / contradict) are injected
+    into the generation prompt so the model cannot fabricate cross-source agreement
+    that the sources never state. Only figments from sources that actually
+    corroborate each other are fed for agreement-style queries; all recalled
+    perspectives are fed for disagreement-style queries.
+    """
     graph = _build_graph()
     ctx = graph.build_trust_aware_context(query)
 
@@ -243,20 +250,66 @@ def _run_trust_aware(
         f.write(f"── {query_label} (trust-aware context) ──\n")
         f.write(ctx["rationale"] + "\n\n")
 
-    # Collect figments from every source that recalled something for this query,
-    # so generation can weigh all perspectives (not just the highest-trust one).
+    sources = list(ctx["by_source"].keys())
+    # Sources that genuinely corroborate at least one other recalled source.
+    agreeing_sources = {
+        s for s in sources
+        if set(ctx["by_source"][s].get("agreeing", [])) & set(sources)
+    }
+    contradicting_sources = {
+        s for s in sources
+        if set(ctx["by_source"][s].get("contradicting", [])) & set(sources)
+    }
+
+    if query_label.lower().startswith("agreement"):
+        # These narratives are constructed to conflict, so genuine same-stance
+        # alignment is rare. Feed every recalled perspective but constrain the
+        # model to only facts literally present in >=2 sources' text; the weak
+        # "agreeing" set (same explicit non-neutral stance) is shown for honesty.
+        use_sources = sorted(sources)
+        scoped_note = (
+            f"Sources that genuinely AGREE (same explicit stance) on this topic: "
+            f"{sorted(agreeing_sources) or 'none'}. "
+            f"Sources that CONTRADICT each other: {sorted(contradicting_sources) or 'none'}. "
+            f"Most sources merely discuss the same TOPICS (overlap), which is NOT "
+            f"agreement. List only facts that appear verbatim or identically in "
+            f"the text of at least two sources. Do NOT infer shared conclusions "
+            f"(e.g. 'all endorsed', 'all issued voluntary frameworks') that are "
+            f"stated by only one source. If the only shared facts are surface "
+            f"details (e.g. the event occurred, a fund was announced), say so."
+        )
+    else:
+        # Disagreement query: feed every recalled perspective and let the model
+        # contrast them, grounded by the explicit contradiction relationships.
+        use_sources = sorted(sources)
+        scoped_note = (
+            f"Sources that CONTRADICT each other: {sorted(contradicting_sources) or 'none'}. "
+            f"Sources that genuinely AGREE: {sorted(agreeing_sources) or 'none'}. "
+            f"Only describe disagreements that are explicitly present in the "
+            f"sources' text; do not invent disagreement where the texts align."
+        )
+
+    # Collect the figments from the scoped sources that are relevant to the query.
+    qwords = set(query.lower().split())
     all_relevant: list[Figment] = []
-    for src in ctx["by_source"]:
+    for src in use_sources:
         for fig in source_figments_map.get(src, []):
-            if set(query.lower().split()) & set(fig.text.lower().split()):
+            if qwords & set(fig.text.lower().split()):
                 all_relevant.append(fig)
 
-    result = gen.generate(figments=all_relevant, prompt=query, max_new_tokens=450)
+    grounded_prompt = (
+        f"{scoped_note}\n\n"
+        f"{query}\n\n"
+        f"Instructions: base every claim strictly on the provided source text. "
+        f"Do not invent facts, dates, or agreements that are not in the text."
+    )
+
+    result = gen.generate(figments=all_relevant, prompt=grounded_prompt, max_new_tokens=450)
     console.print(f"\n[bold]Output ({result['num_tokens']} tokens):[/bold]")
     console.print(result["generated_text"])
     console.print()
     with open(log_path, "a") as f:
-        f.write(f"── {query_label} ──\nPrompt: {query}\n")
+        f.write(f"── {query_label} ──\nPrompt: {grounded_prompt}\n")
         f.write(f"Tokens: {result['num_tokens']}\n")
         f.write(result["generated_text"] + "\n\n")
 

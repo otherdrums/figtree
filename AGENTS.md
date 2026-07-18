@@ -65,7 +65,7 @@ from figtree.kernel.boundary_project import project_boundaries_to_kv
 k_figments, v_figments = project_boundaries_to_kv(boundaries, layer, device)
 ```
 
-**Note:** For 4-bit quantized models, the Python wrapper falls back to PyTorch `matmul` because bitsandbytes stores weights in a packed format that the raw CUDA kernel cannot access. The kernel is still built and available for non-quantized models.
+**Note:** For 4-bit quantized models (e.g. `unsloth/Qwen3-4B-bnb-4bit`), the Python wrapper in `boundary_project.py` **dequantizes** the bitsandbytes 4-bit weight to bf16 on the fly (contiguous `(hidden, kv_dim)` layout) and runs the same CUDA kernel — no PyTorch `matmul` fallback needed. The kernel is only bypassed if it fails to build, in which case a PyTorch `matmul` fallback is used.
 
 ### Figment Primitive
 
@@ -145,7 +145,9 @@ result = gen.generate_from_boundaries(
 3. Inserts into `DynamicCache` directly — no forward pass for figment tokens
 4. Prompt prefill + decode proceed as usual
 
-The boundary-based approach avoids re-running the forward pass for figment tokens, trading ~2.8 MB/figment disk storage for ~20% faster generation. Per-token K/V is computed during ingestion by capturing each layer's input hidden state, applying `input_layernorm`, and projecting through `k_proj`/`v_proj` with `k_norm` applied. This matches the model's internal computation exactly, enabling factual recall with standard HF attention.
+The boundary-based approach avoids re-running the forward pass for figment tokens, trading ~2.8 MB/figment disk storage. On the 3GB test GPU the KV-load + RoPE cost roughly cancels the saved forward pass, so wall-clock is comparable to text-based generation; the benefit is the storage/compute trade-off. Per-token K/V is computed during ingestion by capturing each layer's input hidden state, applying `input_layernorm`, and projecting through `k_proj`/`v_proj` with `k_norm` applied. This matches the model's internal computation exactly, enabling factual recall with standard HF attention.
+
+Both `generate` and `generate_from_boundaries` wrap the prompt in the Qwen3 ChatML template (`figtree/kernel/prompt.py:build_prompt_ids`, thinking disabled) and apply `repetition_penalty=1.15` during decoding. Figment texts are concatenated with `\n\n` separators during ingestion; the boundary path replays the exact same per-figment K/V slices, so boundary-based output matches text-based output in content.
 
 ### Graph as Figments
 
@@ -155,7 +157,7 @@ from figtree.graph import Figtree
 graph = Figtree(all_figments)
 graph.deduplicate()            # exact + semantic boundary similarity
 graph.create_edges()           # SUPPORTS, SAME_ENTITY, CONTRADICTS
-graph.propagate_trust()        # source trust → figments + alignment boost
+graph.propagate_trust(output_dir=...)  # source-based, idempotent, disk-persisted
 ```
 
 All graph operations produce **new Figments**:
@@ -176,14 +178,17 @@ python3 examples/davos_benchmark_v2.py
 
 | Phase | Time | Throughput |
 |-------|------|------------|
-| Ingestion | 23.4s | 41 figments, 445 KB |
-| Generation | 33.6s | 100 tokens, 35 figments |
-| Graph | 0.0s | 38 figments, 3 edges |
-| **Total** | **57.0s** | |
+| Ingestion | ~18s | ~38 atomic figments |
+| Generation (text) | ~50s | 4 sources × 400 tokens |
+| Generation (boundary) | ~58s | 4 sources × 400 tokens |
+| Graph | <1s | 3 sources, persisted trust |
+| **Total** | **~2 min** | |
 
-Boundary-based generation (`generate_from_boundaries`) achieves ~22% faster
-generation vs text-based (`generate`) by skipping per-figment forward passes,
-at the cost of ~2.8 MB/figment disk storage.
+Boundary-based generation (`generate_from_boundaries`) skips the per-figment
+forward pass by replaying cached K/V, at the cost of ~2.8 MB/figment disk
+storage. On the 3GB test GPU the wall-clock is comparable to text-based
+generation (KV-load + RoPE roughly cancels the saved forward pass); the benefit
+is the storage/compute trade-off, not a fixed speedup.
 
 ## Key Commands
 
@@ -215,18 +220,29 @@ result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
 
 2. **Boundaries for retrieval, text for generation**: Boundaries (~10 KB) enable fast similarity search and deduplication. Text is used to regenerate full KV caches on-the-fly during generation. This gives compact storage without sacrificing recall.
 
-3. **Custom CUDA kernel for boundary projection**: The kernel compiles and works, but 4-bit quantized models require a PyTorch fallback due to bitsandbytes' packed weight format. For non-quantized models, the CUDA kernel provides optimized boundary→K/V projection.
+3. **Custom CUDA kernel for boundary projection**: The kernel compiles and works for non-quantized models. For 4-bit quantized models (bitsandbytes packed weights), the Python wrapper dequantizes the weight to bf16 on the fly and runs the same kernel — no PyTorch `matmul` fallback needed unless the kernel fails to build.
 
 4. **On-the-fly KV generation**: Instead of storing KV caches on disk (~90 MB per image), we regenerate them from text during generation. This trades computation for storage and keeps the system lightweight.
 
-5. **Pre-computed KV cache**: The `kv_cache.npy` stores per-token unrotated K/V for all layers, computed during ingestion with proper `input_layernorm`. RoPE is applied lazily during generation. This enables ~22% faster generation by skipping the forward pass for figment tokens.
+5. **Pre-computed KV cache**: The `kv_cache.npy` stores per-token unrotated K/V for all layers, computed during ingestion with proper `input_layernorm`. RoPE is applied lazily during generation. This skips the forward pass for figment tokens (boundary path); wall-clock saving depends on GPU/context.
 
 6. **Figment-centric graph**: All relationships (SUPPORTS, CONTRADICTS, TRUST) are first-class Figments with their own boundaries and text. During generation, the model can load meta-figments alongside content figments, enabling trust-aware reasoning through attention.
 
 ## Known Limitations
 
-1. **On-the-fly KV generation is slower than pre-computed**: ~30s for 35 figments with text-based generation. Boundary-based generation (`generate_from_boundaries`) with cached K/V is ~22% faster at ~25s. Still slower than fully pre-loaded KV caches.
+1. **Boundary-based generation is not a fixed speedup**: On the 3GB test GPU, text-based generation is ~50s and boundary-based ~58s for 4 sources × 400 tokens. The skipped forward pass is offset by KV-load + RoPE. The trade-off is disk storage (~2.8 MB/figment) vs recompute, not wall-clock.
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB headroom. Works for 300–500 token contexts. For longer contexts, use Qwen3-2B or larger GPU.
 
 3. **kv_cache.npy storage**: ~2.8 MB per 20-token figment. 100 figments = ~280 MB. Manageable on modern drives but not as compact as ~10 KB boundary-only storage.
+
+4. **Per-source recall is verbatim-grounded; cross-source synthesis is model-generated**. QUERY 1/4 (per-source) reproduce each narrative's figures faithfully. The trust-aware QUERY 2/3 synthesize across sources via the LLM; to avoid fabricated agreement the demo grounds the prompt with `analyze_sources` relationships (`related`/`agreeing`/`contradicting`) and instructs the model to only state facts present in ≥2 source texts. Even so, the small model can under-describe disagreements.
+
+5. **Source texts omit a year** (they say "concluded yesterday"), so the model may infer a date (it guessed 2023/2024 inconsistently). This is model inference, not a recall error.
+
+## Source-Based Trust Model
+
+- Each source has an **immutable** `base_trust` stored on its image figment's `meta["base_trust"]` at ingest. Persisted `trust:{source_id}` figments carry the *adjusted* score and are never read back as base (prevents trust drift across reloads).
+- `Figtree.analyze_sources()` returns, per source: `related` (topic overlap), `agreeing` (same explicit non-neutral stance), `contradicting` (opposite stance), `corroborated_frac`, and `adjusted_trust = min(1, max(0, 0.6·base + 0.4·corroborated)) × 0.85 if contradicted`.
+- `Figtree.propagate_trust(output_dir=...)` is **idempotent and disk-persistent**: it (re)creates one trust figment per source with a deterministic id (`trust:{source_id}`), overwriting the previous file. A future "accuracy proven → trust up" step only edits `meta["score"]` on that figment and re-runs `propagate_trust`. No schema change.
+- `Figtree.build_trust_aware_context(query)` recalls every perspective relevant to a query with its credibility relationships; the demo injects these into the generation prompt so cross-source claims are grounded in the actual texts.
