@@ -110,7 +110,7 @@ def main():
         result = gen.generate(figments=[], prompt=f"{context}\n\n{query}", max_new_tokens=120)
         dt = time.perf_counter() - t0
 
-        out = result["text"]
+        out = result["generated_text"]
         # fidelity: average over sources that contributed to the retrieved set
         sources_in = {c["source"] for c in top}
         if sources_in:

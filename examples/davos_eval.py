@@ -37,10 +37,13 @@ QUERIES = {
 
 # Source-specific checkable figures for fidelity scoring. A query is "faithful"
 # to a source if the generated text contains that source's distinctive figures.
+# Figures are pulled from davos_narratives/*.txt and chosen to be distinctive
+# per source (shared figures like "2,700 delegates" / "130 countries" are
+# excluded so they don't inflate any single source's score).
 SOURCE_FIGURES = {
-    "pro_globalist": ["3,000", "3000", "2 billion", "2bn", "pledge", "pledged"],
-    "anti_globalist": ["50 million", "50m", "elite", "luxury", "caviar"],
-    "conspiracy": ["secret", "treaty", "15 families", "climate lock"],
+    "pro_globalist": ["4 trillion", "150 billion", "3%"],
+    "anti_globalist": ["15%"],
+    "conspiracy": ["2030", "400"],
 }
 
 
