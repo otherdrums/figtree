@@ -90,7 +90,7 @@ def do_ingest():
 
         figments = ingest_text_to_figments(
             model=model, tokenizer=tokenizer, text=text,
-            output_dir=None, source_id=key, store=store,
+            source_id=key, store=store,
             kv_manager=kv_manager, compute_kv=compute_kv,
             trust=source["trust"], min_chars=20,
         )

@@ -7,22 +7,15 @@ Everything is a Figment:
 - A trust assertion (Figment with meta["edge_type"] = "trust")
 - Even the system itself (meta-figments about Figtree)
 
-Storage (.figment format):
-    figment.figment/
-    ├── manifest.json     # figment_id, children, meta, sources, trust
-    ├── boundary.npy      # (hidden_size,) float32 — crystal layer (backward compat)
-    ├── boundaries.npy    # (num_layers, hidden_size) float32 — per-layer boundaries
-    ├── boundary_emb.npy  # (hidden_size,) float32 — last-token embedding
-    ├── kv_cache.npy      # (num_layers, seq_len, 2, kv_dim) — unrotated K/V
-    └── text.txt          # Natural language statement
+Figments are persisted as rows in a LanceDB table (see ``figtree/lancedb_store.py``);
+K/V caches live outside the row as external quantized blobs managed by
+``figtree/kv_cache_manager.py``.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -75,57 +68,6 @@ class Figment:
             children=children or [],
             sources=sources or [],
             trust=trust,
-        )
-
-    def save(self, output_dir: Path) -> Path:
-        """Write to .figment directory. Returns path."""
-        output_dir = Path(output_dir)
-        figment_dir = output_dir / f"{self.figment_id}.figment"
-        figment_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest = {
-            "figment_id": self.figment_id,
-            "text": self.text,
-            "meta": self.meta,
-            "children": self.children,
-            "sources": self.sources,
-            "trust": self.trust,
-            "hidden_size": int(self.hidden_size),
-        }
-        (figment_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
-        np.save(figment_dir / "boundary.npy", self.boundary)
-        if self.boundaries is not None:
-            np.save(figment_dir / "boundaries.npy", self.boundaries)
-        if self.boundary_emb is not None:
-            np.save(figment_dir / "boundary_emb.npy", self.boundary_emb)
-        (figment_dir / "text.txt").write_text(self.text)
-
-        return figment_dir
-
-    @classmethod
-    def load(cls, figment_dir: Path) -> "Figment":
-        """Load from .figment directory."""
-        figment_dir = Path(figment_dir)
-        manifest = json.loads((figment_dir / "manifest.json").read_text())
-        boundary = np.load(figment_dir / "boundary.npy")
-        boundaries = boundary_like = None
-        bd_path = figment_dir / "boundaries.npy"
-        if bd_path.exists():
-            boundaries = np.load(bd_path)
-        emb_path = figment_dir / "boundary_emb.npy"
-        if emb_path.exists():
-            boundary_like = np.load(emb_path)
-        figment_id = manifest["figment_id"]
-        return cls(
-            figment_id=figment_id,
-            text=manifest["text"],
-            boundary=boundary,
-            boundaries=boundaries,
-            boundary_emb=boundary_like,
-            meta=manifest.get("meta", {}),
-            children=manifest.get("children", []),
-            sources=manifest.get("sources", []),
-            trust=manifest.get("trust", 0.5),
         )
 
     def is_image(self) -> bool:

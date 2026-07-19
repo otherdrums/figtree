@@ -10,16 +10,15 @@ Trust design (recall-aware + mutable):
   recalls every perspective and explains each one's credibility from (a) the
   source's base trust and (b) how many *other* sources corroborate or contradict
   its claims.
-- Trust Figments are canonical per source_id and are persisted to disk by
-  `propagate_trust(output_dir=...)` so the score is re-runnable and editable:
+- Trust Figments are canonical per source_id and are persisted to the LanceDB
+  store by `propagate_trust(store=...)` so the score is re-runnable and editable:
   a future "accuracy proven -> trust up" step only edits `meta["score"]` and
-  re-runs `propagate_trust`, overwriting the same file. No schema change needed.
+  re-runs `propagate_trust`, overwriting the same row. No schema change needed.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from pathlib import Path
 
 import numpy as np
 
@@ -240,13 +239,19 @@ class Figtree:
                     edges.append(edge)
         return edges
 
-    def propagate_trust(self, output_dir: Path | None = None, store=None) -> list[dict]:
-        """Recompute + (optionally) persist canonical trust Figments per source.
+    def propagate_trust(self, store=None) -> list[dict]:
+        """Recompute + persist canonical trust Figments per source.
 
         Idempotent: a single trust Figment per source_id is (re)created with a
-        deterministic id and overwrites the previous one on disk / in the store,
-        so future trust adjustments only need to edit `meta["score"]` and re-run.
+        deterministic id and overwrites the previous row in the store, so future
+        trust adjustments only need to edit `meta["score"]` and re-run. Requires a
+        ``store`` (LanceDB-backed persistence).
         """
+        if store is None:
+            raise ValueError(
+                "store is required: trust Figments are persisted to a LanceDB store. "
+                "Pass a FigmentStore from figtree.lancedb_store.connect()."
+            )
         analysis = self.analyze_sources()
         updates = []
         for src, info in analysis.items():
@@ -274,12 +279,7 @@ class Figtree:
             self.figments[fid] = trust_fig
             updates.append({"source_id": src, "trust": info["adjusted_trust"], **info})
 
-            if store is not None:
-                store.upsert_one(trust_fig)
-            elif output_dir is not None:
-                out = Path(output_dir) / src
-                out.mkdir(parents=True, exist_ok=True)
-                trust_fig.save(out)
+            store.upsert_one(trust_fig)
 
         return updates
 

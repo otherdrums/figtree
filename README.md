@@ -67,14 +67,16 @@ just another figment — recursive, composable, and uniform.
 ```bash
 pip install -e .
 
-# Full Davos demo (ingest + generate + graph)
+# CLI (thin wrapper around the Davos demo phases)
+figtree all          # ingest + generate + graph
+figtree benchmark     # phase timings
+figtree compare       # Figtree vs a conventional RAG baseline
+
+# Or run the demos directly
 python3 examples/run_davos_v2.py all
-
-# Interactive shell
 python3 examples/davos_shell_v2.py
-
-# Benchmark
 python3 examples/davos_benchmark_v2.py
+python3 examples/rag_baseline_davos.py   # conventional RAG baseline
 ```
 
 ## Demo
@@ -222,9 +224,9 @@ Trust is **source-based and mutable**, not a fixed graph attribute:
   to (topic overlap), `agreeing` with (same explicit non-neutral stance), and
   `contradicting` (opposite stance). Adjusted trust = `0.6·base + 0.4·corroborated`
   then ×0.85 if contradicted by others.
-- `propagate_trust(output_dir=...)` is **idempotent and disk-persistent**: it (re)
+- `propagate_trust(store=...)` is **idempotent and store-persistent**: it (re)
   creates one trust figment per source with a deterministic id, overwriting the
-  previous file. A future "accuracy proven → trust up" step only edits
+  previous row. A future "accuracy proven → trust up" step only edits
   `meta["score"]` on that figment and re-runs `propagate_trust`. No schema change.
 - `build_trust_aware_context(query)` recalls every perspective relevant to a query
   together with its credibility relationships, which the demo injects into the
@@ -312,8 +314,9 @@ Figtree extends these concepts with:
 - **One universal primitive** — Everything is a Figment (images, edges, trust,
   metadata). An Image is a Figment with children.
 - **Pre-computed per-token KV cache** — During ingestion, each figment's
-  unrotated K/V is computed for all layers and stored as `kv_cache.npy`
-  (~2.8 MB per 20-token figment). During generation, RoPE is applied and K/V
+  unrotated K/V is computed for all layers and stored as an external quantized
+  blob addressed by `kv_uri` (~2.8 MB per 20-token figment before quantization;
+  lazy by default, eager optional). During generation, RoPE is applied and K/V
   is inserted directly into the cache — no forward pass needed.
 - **Boundary + KV hybrid storage** — Boundaries (~10 KB) for retrieval and
   similarity search; KV cache (~2.8 MB per figment) for generation.
@@ -323,3 +326,15 @@ Figtree extends these concepts with:
 
 **chrishayuk/larql** — The boundary residual concept, crystal layer detection,
 boundary-kv engine architecture, and "model IS the database" philosophy.
+
+## Status
+
+FigTree is early research code (v0.2.x, Alpha). It is not production-ready and
+does not claim to be. Figments are persisted in a LanceDB store; the legacy
+`.figment/` directory format has been removed. Known limitations (small
+target GPU, basic graph/trust layer, sentence-level atomicity, no portability
+guarantees beyond Qwen3) are documented in `AGENTS.md`.
+
+## License
+
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 Brian Mulkern.

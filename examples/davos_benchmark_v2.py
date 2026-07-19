@@ -62,7 +62,7 @@ def benchmark():
         text = (NARRATIVES_DIR / f"{key}.txt").read_text().strip()
         figments = ingest_text_to_figments(
             model=model, tokenizer=tokenizer, text=text,
-            output_dir=None, source_id=key, store=store,
+            source_id=key, store=store,
             kv_manager=kv_manager, compute_kv=False,
             trust=SOURCES[key]["trust"], min_chars=20,
         )

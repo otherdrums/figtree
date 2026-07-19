@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import gc
 import re
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -137,11 +136,57 @@ def detect_crystal_layer(
     return max(1, len(model.model.layers) // 2)
 
 
+def boundary_for_text(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    text: str,
+    crystal_layer: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (boundary, boundaries, boundary_emb) for the last token of ``text``.
+
+    ``boundary`` is the hidden state at ``crystal_layer``; ``boundaries`` is the
+    per-layer hidden state of the last token; ``boundary_emb`` is the last-token
+    input embedding. Reused by hierarchical summarization to give a higher-level
+    Image figment its own genuine boundary instead of copying a child's.
+    """
+    if crystal_layer is None:
+        crystal_layer = detect_crystal_layer(model, tokenizer)
+    device = model.device
+    num_layers = len(model.model.layers)
+
+    ids = tokenizer.encode(text, return_tensors="pt").to(device)
+    layer_outputs: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(idx):
+        def hook(mod, inp, out):
+            o = out[0] if isinstance(out, tuple) else out
+            layer_outputs[idx] = o.detach()
+        return hook
+
+    for li in range(num_layers):
+        handles.append(model.model.layers[li].register_forward_hook(make_hook(li)))
+    try:
+        with torch.no_grad():
+            emb_out = model.get_input_embeddings()(ids)
+            model(ids)
+            last = ids.shape[1] - 1
+            boundaries_arr = torch.stack(
+                [layer_outputs[li][0, last, :].float().cpu() for li in range(num_layers)]
+            ).numpy()
+            boundary_emb = emb_out[0, last, :].float().cpu().numpy()
+    finally:
+        for h in handles:
+            h.remove()
+
+    return boundaries_arr[crystal_layer], boundaries_arr, boundary_emb
+
+
+
 def ingest_text_to_figments(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     text: str,
-    output_dir: Path | str | None = None,
     source_id: str = "",
     trust: float = 0.5,
     crystal_layer: int | None = None,
@@ -149,22 +194,25 @@ def ingest_text_to_figments(
     store=None,
     kv_manager=None,
     compute_kv: bool = False,
+    summarize_images: bool = False,
 ) -> list[Figment]:
     """Ingest text into atomic figments with boundary + (optional) K/V capture.
 
-    Storage is LanceDB-backed when ``store`` is provided (recommended). When
-    ``store`` is omitted, figments are still returned in memory and (for backward
-    compatibility) written as ``.figment/`` directories under ``output_dir``.
+    Storage is LanceDB-backed: ``store`` is required. Figments are upserted as
+    compressed rows; the lightweight LanceDB row holds the boundary + text +
+    metadata, while K/V caches live outside the row as external quantized blobs.
 
     K/V caching: by default (``compute_kv=False``) no K/V blob is persisted
     (lazy mode — recomputed on demand by ``KVCacheManager``). Set
     ``compute_kv=True`` (and pass a ``kv_manager``) to eagerly persist quantized
     K/V blobs and record ``kv_uri`` on each figment.
     """
+    if store is None:
+        raise ValueError(
+            "store is required: figments are persisted to a LanceDB store. "
+            "Pass a FigmentStore from figtree.lancedb_store.connect()."
+        )
     device = model.device
-    if output_dir is not None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
 
     if crystal_layer is None:
         crystal_layer = detect_crystal_layer(model, tokenizer)
@@ -287,10 +335,10 @@ def ingest_text_to_figments(
                         kv_manager._write_blob(uri, qkv, qmeta)  # noqa: SLF001
                         figment.meta["kv_uri"] = uri
                         figment.meta["has_kv_cache"] = True
-                    elif output_dir is not None:
-                        # Backward-compat: write kv_cache.npy next to figment dir.
-                        figment_dir = figment.save(output_dir)
-                        np.save(figment_dir / "kv_cache.npy", kv_cache_t)
+                    else:
+                        raise ValueError(
+                            "compute_kv=True requires a kv_manager to persist K/V blobs."
+                        )
 
             layer_outputs.clear()
 
@@ -302,9 +350,23 @@ def ingest_text_to_figments(
         for h in handles:
             h.remove()
 
+    image_boundary = sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1)
+    image_boundaries = sentence_figments[0].boundaries.copy() if sentence_figments else None
+    image_emb = sentence_figments[0].boundary_emb.copy() if sentence_figments else None
+    image_text = text
+    if summarize_images and sentence_figments:
+        from figtree.summarize import summarize_image
+
+        summary, image_boundary, image_boundaries, image_emb = summarize_image(
+            model, tokenizer, sentence_figments, crystal_layer=crystal_layer
+        )
+        image_text = summary
+
     image = Figment.create(
-        text=text,
-        boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
+        text=image_text,
+        boundary=image_boundary,
+        boundaries=image_boundaries,
+        boundary_emb=image_emb,
         meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True, "base_trust": trust},
         children=[f.figment_id for f in sentence_figments],
         trust=trust,
@@ -319,14 +381,8 @@ def ingest_text_to_figments(
 
     all_figments = [image] + sentence_figments + [trust_figment]
 
-    if store is not None:
-        hidden = image.boundary.shape[0]
-        # Upsert in deterministic id order so trust/image overwrite cleanly.
-        store.upsert(all_figments, hidden_size=hidden)
-    elif output_dir is not None:
-        image.save(output_dir)
-        trust_figment.save(output_dir)
-        for f in sentence_figments:
-            f.save(output_dir)
+    hidden = image.boundary.shape[0]
+    # Upsert in deterministic id order so trust/image overwrite cleanly.
+    store.upsert(all_figments, hidden_size=hidden)
 
     return all_figments

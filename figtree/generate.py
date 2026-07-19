@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import gc
 import time
-from pathlib import Path
 
-import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
@@ -176,15 +174,18 @@ class FigmentGenerator:
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
         kv_manager=None,
-        cache_dir: str = "./figments",
     ) -> dict:
         """Generate using per-token cached K/V.
 
         K/V is obtained from ``kv_manager.materialize`` (LanceDB-backed, lazy by
         default — recomputes on demand; eager if blobs were persisted at ingest).
-        For backward compatibility, if ``kv_manager`` is None and ``cache_dir`` is
-        provided, K/V is loaded from ``cache_dir/<id>.figment/kv_cache.npy``.
+        ``kv_manager`` is required for boundary-based generation.
         """
+        if kv_manager is None:
+            raise ValueError(
+                "kv_manager is required for generate_from_boundaries. "
+                "Use a KVCacheManager (figtree.kv_cache_manager.KVCacheManager)."
+            )
         device = self.device
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
@@ -198,27 +199,12 @@ class FigmentGenerator:
         all_k: list[torch.Tensor] = []
         all_v: list[torch.Tensor] = []
 
-        if kv_manager is not None:
-            kv_map = kv_manager.materialize(figments)
-            for fig in figments:
-                kv = kv_map[fig.figment_id]
-                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-                all_k.append(kv_t[:, :, 0, :])
-                all_v.append(kv_t[:, :, 1, :])
-        else:
-            cache_root = Path(cache_dir)
-            for fig in figments:
-                fdir = cache_root / f"{fig.figment_id}.figment"
-                kv_path = fdir / "kv_cache.npy"
-                if not kv_path.exists():
-                    raise FileNotFoundError(
-                        f"No kv_cache.npy for figment {fig.figment_id[:12]}... "
-                        f"Re-ingest the text or use generate() instead."
-                    )
-                kv = np.load(str(kv_path))
-                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-                all_k.append(kv_t[:, :, 0, :])
-                all_v.append(kv_t[:, :, 1, :])
+        kv_map = kv_manager.materialize(figments)
+        for fig in figments:
+            kv = kv_map[fig.figment_id]
+            kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
+            all_k.append(kv_t[:, :, 0, :])
+            all_v.append(kv_t[:, :, 1, :])
 
         total_tokens = sum(k.shape[1] for k in all_k)
 

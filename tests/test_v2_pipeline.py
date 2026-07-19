@@ -55,7 +55,7 @@ def main():
     print("\nIngesting text into LanceDB figments...")
     figments = ingest_text_to_figments(
         model=model, tokenizer=tokenizer, text=TEXT,
-        output_dir=None, source_id="test_source", trust=0.95,
+        source_id="test_source", trust=0.95,
         store=store, kv_manager=kv_manager, compute_kv=False,
     )
     print(f"Created {len(figments)} figments in {STORE_URI}")
