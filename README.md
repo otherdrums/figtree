@@ -309,9 +309,13 @@ python3 examples/davos_benchmark_v2.py
    headroom. Works for 300–500 token contexts. For longer context or larger
    models, use Qwen3-2B (~1.5GB) or a 6GB+ GPU.
 
-## Inspiration
+## Inspiration & Related Work
 
-Directly inspired by [**chrishayuk/larql**](https://github.com/chrishayuk/larql):
+### LARQL (primary inspiration)
+
+Figtree is **directly and substantially inspired by**
+[**chrishayuk/larql**](https://github.com/chrishayuk/larql), whose boundary-residual
+ideas are central to this project. In particular:
 
 - **Boundary residuals** — LARQL stores one residual vector per text window at
   the crystal layer. The Apollo 11 transcript demo (370K tokens) compresses to
@@ -336,10 +340,65 @@ Figtree extends these concepts with:
   similarity search; KV cache (~2.8 MB per figment) for generation.
 - **Graph as figments** — All relationships and trust are first-class Figments.
 
+### Theoretical grounding: the residual stream is primary
+
+Both LARQL and Figtree rest on a now well-supported view of transformer
+internals: **the residual stream (not the K/V cache) is the primary carrier of
+meaning**, and K/V entries are largely a re-projection of residual state needed
+to compute attention scores. The theoretical line of work on residual-stream
+superposition and the linear representation of features in residual activations
+grounds the claim that a single residual/boundary vector can stand in for a
+window of context, and that carefully captured residual states can be replayed
+(optionally with K/V re-derived) to recover a model's factual behavior. Figtree's
+boundary vectors and per-layer residual capture are a direct application of that
+view: retrieval operates on residual state, while K/V is treated as a
+derivative, secondary artifact.
+
+### Situating Figtree against neighboring approaches
+
+Figtree is **novel as a coherent systems design and philosophical unification**
+("everything is a Figment"); it does not claim novelty at the level of the
+underlying residual/boundary mechanics, nor the insight that KV is secondary to
+residual state. It sits alongside several neighboring lines of work:
+
+- **Pure residual approaches** — Systems that store and retrieve residual
+  activations (or compressed "memory vectors") per context window, replaying
+  them to condition generation without recomputing the prefix. Figtree shares
+  the residual-is-primary stance but adds the Figment unification (edges, trust,
+  and images are themselves retrievable residuals) and pairs residual retrieval
+  with re-derived K/V for standard HF attention.
+- **Precomputed / cached-KV approaches** — Methods that materialize a prompt's
+  K/V once and reuse it across queries (prefix caching, KV-store services).
+  Figtree goes further by *persisting per-figment K/V externally* and re-inserting
+  it into the attention cache during generation, so ingested knowledge is
+  directly addressable rather than recomputed per query.
+- **Grafting / context-stitching** — Techniques that splice external context
+  (retrieved passages, tool outputs, or prior generations) into a live attention
+  window. Figtree's boundary→K/V replay is a form of grafting grounded in the
+  model's own computation, applied uniformly to every Figment.
+- **Residual checkpointing / activation store** — Work that checkpoints
+  intermediate hidden states for resumption or editing. Figtree's per-layer
+  `boundaries` tensor is a checkpoint of exactly this kind, enabling both
+  retrieval (last-layer boundary) and faithful K/V re-derivation (all layers).
+
+Concurrent 2026 work in KV precompute, residual grafting, and residual
+checkpointing converges on the same thesis Figtree builds on: **knowledge can be
+stored in the model's own activation space and replayed**, rather than only in
+weights or in raw text. Figtree's contribution is to make that thesis the basis
+of a single recursive data model where the stored artifacts are themselves
+first-class, queryable objects.
+
 ## Credit
 
 **chrishayuk/larql** — The boundary residual concept, crystal layer detection,
-boundary-kv engine architecture, and "model IS the database" philosophy.
+boundary-kv engine architecture, and "model IS the database" philosophy. This
+project would not exist in its current form without LARQL; its ideas are central
+to Figtree's design, not merely incidental prior art.
+
+Related concepts (residual-stream representation theory; prefix/KV caching;
+grafting and residual checkpointing) are part of the broader research context
+and are acknowledged above for intellectual lineage, without implying those
+authors endorse or inspired this specific implementation.
 
 ## Status
 
