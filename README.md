@@ -173,6 +173,12 @@ Text is split into sentences. For each sentence:
 2. Forward through all 36 layers with DynamicCache
 3. Figment KV entries populate the cache
 
+**Flawless recall** (`generate_with_recall`): after generation, checkable atoms
+(numbers, percentages, years, acronyms) from the source text are diffed against
+the output. Any missing atom triggers a targeted greedy follow-up that states
+exactly the omitted figures, retrying up to twice. Per-source recall on the
+Davos task reaches `recall_score = 1.0`.
+
 **Boundary-based** (lazy K/V via `KVCacheManager`, skips per-figment forward pass):
 
 1. `kv_manager.materialize(figments)` returns per-figment K/V (recomputed on

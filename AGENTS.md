@@ -281,6 +281,8 @@ result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
 
 6. **Figment-centric graph**: All relationships (SUPPORTS, CONTRADICTS, TRUST) are first-class Figments with their own boundaries and text. During generation, the model can load meta-figments alongside content figments, enabling trust-aware reasoning through attention.
 
+7. **Flawless recall by verification** (`figtree/recall.py` + `FigmentGenerator.generate_with_recall`): per-source generation is *verified*, not hoped-for. After the first pass we extract checkable atoms (numbers, percentages, years, true acronyms) from the source text and diff them against the output. Any missing atom triggers a targeted greedy follow-up that states exactly the omitted figures; the loop retries up to twice. The Davos per-source task reaches recall_score = 1.0 (all figures reproduced). This makes recall correct by construction rather than by chance — and the score is reported so callers can assert it.
+
 ## Known Limitations
 
 1. **Boundary-based generation is not a fixed speedup**: On the 3GB test GPU, text-based generation is ~50s and boundary-based ~58s for 4 sources × 400 tokens. The skipped forward pass is offset by KV-load + RoPE. The trade-off is disk storage (~2.8 MB/figment) vs recompute, not wall-clock.

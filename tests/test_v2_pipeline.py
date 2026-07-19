@@ -110,6 +110,20 @@ def main():
         f"entities text={text_hits} boundary={bd_hits})."
     )
 
+    # Flawless-recall verification: generate_with_recall must reproduce every
+    # checkable atom (here: 130, 2,700) from the source text, patching any gaps.
+    all_atomic = [f for f in atomic_figments if not f.is_image() and not f.is_trust_assertion()]
+    recall_res = gen.generate_with_recall(
+        figments=all_atomic,
+        prompt="What happened at Davos? Include every number and detail.",
+        source_texts=[TEXT],
+        max_new_tokens=200,
+    )
+    print(f"Recall score: {recall_res['recall_score']:.2f} "
+          f"(missing: {recall_res['missing_atoms']})")
+    assert recall_res["recall_score"] >= 1.0, \
+        f"Recall not flawless: missing {recall_res['missing_atoms']}"
+
     # Graph + persisted trust via store (idempotent).
     print("\nBuilding graph...")
     graph = Figtree(store.all(), store=store)

@@ -169,33 +169,58 @@ def do_generate():
         f.write("\n")
 
     # -- Helper: run + log a query --
-    def run_query(label: str, figments: list[Figment], prompt: str, max_new_tokens: int = 150):
+    def run_query(
+        label: str,
+        figments: list[Figment],
+        prompt: str,
+        max_new_tokens: int = 150,
+        source_texts: list[str] | None = None,
+    ):
         console.print(f"\n[bold]Prompt:[/bold] {prompt}")
         t0 = time.perf_counter()
-        result = gen.generate(
-            figments=figments, prompt=prompt, max_new_tokens=max_new_tokens,
-        )
+        if source_texts:
+            result = gen.generate_with_recall(
+                figments=figments, prompt=prompt, source_texts=source_texts,
+                max_new_tokens=max_new_tokens,
+            )
+        else:
+            result = gen.generate(
+                figments=figments, prompt=prompt, max_new_tokens=max_new_tokens,
+            )
         elapsed = time.perf_counter() - t0
         ntok = result["num_tokens"]
         console.print(f"\n[bold]Output ({ntok} tokens, {elapsed:.1f}s):[/bold]")
         console.print(result["generated_text"])
+        if source_texts and result.get("recall_score") is not None:
+            score = result["recall_score"]
+            miss = result["missing_atoms"]
+            tag = "[bold green]FLAWLESS[/bold green]" if score >= 1.0 else "[bold yellow]gaps[/bold yellow]"
+            console.print(f"[dim]Recall: {score:.2f} {tag}"
+                          + (f" — missing: {miss}" if miss else ""))
         console.print()
 
         with open(log_path, "a") as f:
             f.write(f"── {label} ──\n")
             f.write(f"Prompt: {prompt}\n")
             f.write(f"Tokens: {ntok}, Elapsed: {elapsed:.1f}s\n")
+            if source_texts and result.get("recall_score") is not None:
+                f.write(f"Recall: {result['recall_score']:.2f} "
+                        f"missing={result['missing_atoms']}\n")
             f.write(result["generated_text"] + "\n\n")
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    # -- QUERY 1: Per-Source --
-    console.print("\n[bold underline green]── QUERY 1: Per-Source Generation ──[/bold underline green]")
+    # -- QUERY 1: Per-Source (flawless-recall mode) --
+    console.print("\n[bold underline green]── QUERY 1: Per-Source Generation (recall-verified) ──[/bold underline green]")
     for key, figments in source_figments.items():
         source = SOURCES[key]
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
-        run_query(source["name"], figments, "What happened at Davos? Recount the key details, figures, and claims from this source's narrative.", max_new_tokens=400)
+        run_query(
+            source["name"], figments,
+            "What happened at Davos? Recount the key details, figures, and claims from this source's narrative, including every number.",
+            max_new_tokens=400, source_texts=[source_texts[key]],
+        )
 
     # -- QUERY 2: Agreement (trust-aware) --
     console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? (trust-aware) ──[/bold underline yellow]")
