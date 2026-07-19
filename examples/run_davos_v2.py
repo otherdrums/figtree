@@ -38,6 +38,20 @@ SOURCES = {
     "conspiracy": {"name": "Fringe Blog", "trust": 0.15, "color": "red"},
 }
 
+# Enumeration templates force the model to VERBATIM-list every figure rather
+# than summarize. Used for faithful recall on all queries (per-source + the
+# trust-aware cross-source queries).
+RECOUNT_PROMPT = (
+    "List EVERY figure from the source verbatim as a bullet list: each number, "
+    "percent, year, and named entity. Do not summarize. Include all of them. "
+    "What happened at Davos?"
+)
+CROSS_PROMPT = (
+    "List EVERY figure from the provided sources verbatim. For each source, give "
+    "a bullet list of its numbers, percents, years, and named entities. Do not "
+    "summarize. Include all of them. {query}"
+)
+
 
 def banner(title: str, dim: str = ""):
     console.print()
@@ -218,7 +232,7 @@ def do_generate():
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
         run_query(
             source["name"], figments,
-            "What happened at Davos? Recount the key details, figures, and claims from this source's narrative, including every number.",
+            RECOUNT_PROMPT,
             max_new_tokens=400, source_texts=[source_texts[key]],
         )
 
@@ -226,32 +240,40 @@ def do_generate():
     console.print("\n[bold underline yellow]── QUERY 2: What Do Sources Agree On? (trust-aware) ──[/bold underline yellow]")
     _run_trust_aware(
         "Agreement", "Based on all sources, what facts do they agree on?", gen,
-        source_figments, log_path,
+        source_figments, log_path, source_texts,
     )
 
     # -- QUERY 3: Disagreement (trust-aware) --
     console.print("\n[bold underline red]── QUERY 3: Where Do Sources Disagree? (trust-aware) ──[/bold underline red]")
     _run_trust_aware(
         "Disagreement", "What are the major disagreements between the different perspectives?",
-        gen, source_figments, log_path,
+        gen, source_figments, log_path, source_texts,
     )
 
-    # -- QUERY 4: Boundary-based generation (cached K/V) --
+    # -- QUERY 4: Boundary-based generation (cached K/V, faithful recall) --
     console.print("\n[bold underline blue]── QUERY 4: Boundary-Based Generation (cached K/V) ──[/bold underline blue]")
+    from figtree.recall import missing_atoms, recall_score
     for key, figments in source_figments.items():
         source = SOURCES[key]
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
         try:
+            src_tokens = len(gen.tokenizer.encode(source_texts[key], add_special_tokens=False))
             result_bd = gen.generate_from_boundaries(
-                figments=figments, prompt="What happened at Davos? Recount the key details, figures, and claims from this source's narrative.",
+                figments=figments, prompt=RECOUNT_PROMPT,
                 max_new_tokens=400, kv_manager=kv_manager,
+                faithful=True, source_tokens=src_tokens,
             )
+            score = recall_score(source_texts[key], result_bd["generated_text"])
             console.print(f"\n[bold]Output ({result_bd['num_tokens']} tokens, {result_bd['elapsed']:.1f}s):[/bold]")
             console.print(result_bd["generated_text"])
+            tag = "[bold green]FLAWLESS[/bold green]" if score >= 1.0 else "[bold yellow]gaps[/bold yellow]"
+            console.print(f"[dim]Boundary recall: {score:.2f} {tag}"
+                          + (f" — missing: {missing_atoms(source_texts[key], result_bd['generated_text'])}" if score < 1.0 else ""))
             console.print()
             with open(log_path, "a") as f:
                 f.write(f"── {source['name']} (boundary-based) ──\n")
                 f.write(f"Tokens: {result_bd['num_tokens']}, Elapsed: {result_bd['elapsed']:.1f}s\n")
+                f.write(f"Recall: {score:.2f}\n")
                 f.write(result_bd["generated_text"] + "\n\n")
         except FileNotFoundError as e:
             console.print(f"[yellow]Skipped: {e}[/yellow]")
@@ -279,6 +301,7 @@ def _run_trust_aware(
     gen: "FigmentGenerator",
     source_figments_map: dict[str, list[Figment]],
     log_path: Path,
+    source_texts: dict[str, str] | None = None,
 ) -> None:
     """Recall all perspectives on a query and explain credibility, then generate.
 
@@ -339,25 +362,41 @@ def _run_trust_aware(
     # Collect the figments from the scoped sources that are relevant to the query.
     qwords = set(query.lower().split())
     all_relevant: list[Figment] = []
+    relevant_source_texts: list[str] = []
     for src in use_sources:
         for fig in source_figments_map.get(src, []):
             if qwords & set(fig.text.lower().split()):
                 all_relevant.append(fig)
+        # Feed the full source text so recall verification can check figures.
+        if src in SOURCES and src in source_texts:
+            relevant_source_texts.append(source_texts[src])
 
     grounded_prompt = (
         f"{scoped_note}\n\n"
-        f"{query}\n\n"
+        f"{CROSS_PROMPT.format(query=query)}\n\n"
         f"Instructions: base every claim strictly on the provided source text. "
         f"Do not invent facts, dates, or agreements that are not in the text."
     )
 
-    result = gen.generate(figments=all_relevant, prompt=grounded_prompt, max_new_tokens=450)
+    result = gen.generate_with_recall(
+        figments=all_relevant, prompt=grounded_prompt,
+        source_texts=relevant_source_texts, max_new_tokens=450,
+    )
     console.print(f"\n[bold]Output ({result['num_tokens']} tokens):[/bold]")
     console.print(result["generated_text"])
+    if result.get("recall_score") is not None:
+        score = result["recall_score"]
+        tag = "[bold green]FLAWLESS[/bold green]" if score >= 1.0 else "[bold yellow]gaps[/bold yellow]"
+        console.print(f"[dim]Recall: {score:.2f} {tag} (patches={result.get('patch_attempts', 0)})"
+                      + (f" — missing: {result['missing_atoms']}" if score < 1.0 else ""))
     console.print()
     with open(log_path, "a") as f:
         f.write(f"── {query_label} ──\nPrompt: {grounded_prompt}\n")
         f.write(f"Tokens: {result['num_tokens']}\n")
+        if result.get("recall_score") is not None:
+            f.write(f"Recall: {result['recall_score']:.2f} "
+                    f"patches={result.get('patch_attempts', 0)} "
+                    f"missing={result['missing_atoms']}\n")
         f.write(result["generated_text"] + "\n\n")
 
 

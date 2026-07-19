@@ -31,6 +31,7 @@ from figtree.generate import FigmentGenerator
 from figtree.lancedb_store import connect
 
 from davos_eval import QUERIES, SOURCES, contradiction_aware, fidelity_score, vram_peak_mb
+from figtree.recall import recall_score as _recall_score
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -86,11 +87,13 @@ def main():
     table = Table(show_header=True, header_style="bold")
     table.add_column("Query")
     table.add_column("Fidelity (avg)", justify="right")
+    table.add_column("Recall (atoms)", justify="right")
     table.add_column("Contradiction aware", justify="right")
     table.add_column("Tokens", justify="right")
     table.add_column("Latency (s)", justify="right")
 
     faith_sum = 0.0
+    rc_sum = 0.0
     faith_n = 0
     contra_hits = 0
     tok_total = 0
@@ -117,14 +120,18 @@ def main():
             fs = sum(fidelity_score(out, s) for s in sources_in) / len(sources_in)
         else:
             fs = 0.0
+        # atom-level recall vs the retrieved source texts
+        src_blob = "\n".join(c["text"] for c in top)
+        rc = _recall_score(src_blob, out)
         faith_sum += fs
+        rc_sum += rc
         faith_n += 1
         if contradiction_aware(out):
             contra_hits += 1
         tok_total += result["num_tokens"]
 
         table.add_row(
-            qid, f"{fs:.2f}", "yes" if contradiction_aware(out) else "no",
+            qid, f"{fs:.2f}", f"{rc:.2f}", "yes" if contradiction_aware(out) else "no",
             str(result["num_tokens"]), f"{dt:.1f}",
         )
         console.print(f"\n[bold]{qid}[/bold]: {query}")
@@ -133,6 +140,7 @@ def main():
     total_dt = time.perf_counter() - t0_all
     vram = vram_peak_mb()
     table.add_row("—", f"{faith_sum / max(1, faith_n):.2f}",
+                  f"{rc_sum / max(1, faith_n):.2f}",
                   f"{contra_hits}/{faith_n}", str(tok_total), f"{total_dt:.1f}")
     console.print("\n[bold]RAG baseline summary[/bold]")
     console.print(table)

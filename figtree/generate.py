@@ -46,7 +46,27 @@ class FigmentGenerator:
         top_k: int = 50,
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
+        faithful: bool = False,
+        source_tokens: int | None = None,
     ) -> dict:
+        """Generate from figments by generating KV caches on-the-fly.
+
+        ``faithful`` selects decode settings for factual recall: greedy sampling
+        (``temperature=0``) with a near-neutral ``repetition_penalty`` so rare
+        tokens like numbers are not suppressed. When ``faithful`` is set and
+        ``source_tokens`` is provided, the generation budget is raised to at least
+        ~1.2x the source length (plus slack) so the model cannot run out of room
+        before re-verbalizing every figure.
+        """
+        if faithful:
+            temperature = 0.0
+            top_k = 1
+            top_p = 1.0
+            repetition_penalty = 1.02
+            if source_tokens:
+                needed = int(source_tokens * 1.2) + 64
+                max_new_tokens = max(max_new_tokens, needed)
+
         device = self.device
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
@@ -178,25 +198,34 @@ class FigmentGenerator:
     ) -> dict:
         """Generate, then verify recall against ``source_texts`` and patch gaps.
 
-        Runs :meth:`generate`, then (if ``source_texts`` is supplied) checks which
-        checkable atoms from the sources are missing from the output using
-        :mod:`figtree.recall`. Any missing atoms trigger one targeted follow-up
-        pass that appends the recovered facts. The returned text is the original
-        output with the recovered facts appended, and ``recall_score`` /
-        ``missing_atoms`` are reported so callers can assert flawless recall.
+        This is a *transitional* correctness net: the primary recall guarantee
+        comes from faithful decoding (greedy, low repetition) and a source-sized
+        budget in :meth:`generate`. Any atoms still missing after the first pass
+        trigger a targeted greedy follow-up. ``recall_score`` / ``missing_atoms``
+        / ``patch_attempts`` are reported so callers can confirm the net is inert
+        (and eventually be removed).
         """
         from figtree.recall import build_recall_prompt, missing_atoms, recall_score
+
+        source_tokens = None
+        if source_texts:
+            source_tokens = sum(
+                len(self.tokenizer.encode(t, add_special_tokens=False))
+                for t in source_texts
+            )
 
         result = self.generate(
             figments=figments, prompt=prompt, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k, top_p=top_p,
             repetition_penalty=repetition_penalty,
+            faithful=True, source_tokens=source_tokens,
         )
         text = result["generated_text"]
 
         if not source_texts:
             result["recall_score"] = None
             result["missing_atoms"] = []
+            result["patch_attempts"] = 0
             return result
 
         source_blob = "\n".join(source_texts)
@@ -207,13 +236,11 @@ class FigmentGenerator:
             recall_prompt = (
                 f"{prompt}\n\n{build_recall_prompt(miss)}"
             )
-            # Greedy decode for the patch so the model is more likely to comply
-            # with stating the exact missing figures rather than free-generating.
             patch = self.generate(
                 figments=figments, prompt=recall_prompt,
                 max_new_tokens=recall_max_new_tokens,
                 temperature=0.0, top_k=1, top_p=1.0,
-                repetition_penalty=repetition_penalty,
+                repetition_penalty=1.02,
             )
             text = f"{text.strip()}\n\n{_strip_lead_in(patch['generated_text'])}".strip()
             result["generated_text"] = text
@@ -222,6 +249,7 @@ class FigmentGenerator:
 
         result["recall_score"] = recall_score(source_blob, text)
         result["missing_atoms"] = miss
+        result["patch_attempts"] = attempt
         return result
 
     def generate_from_boundaries(
@@ -234,18 +262,30 @@ class FigmentGenerator:
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
         kv_manager=None,
+        faithful: bool = False,
+        source_tokens: int | None = None,
     ) -> dict:
         """Generate using per-token cached K/V.
 
         K/V is obtained from ``kv_manager.materialize`` (LanceDB-backed, lazy by
         default — recomputes on demand; eager if blobs were persisted at ingest).
-        ``kv_manager`` is required for boundary-based generation.
+        ``kv_manager`` is required for boundary-based generation. ``faithful`` and
+        ``source_tokens`` behave as in :meth:`generate` (greedy decode + budget
+        sized from the source length for factual recall).
         """
         if kv_manager is None:
             raise ValueError(
                 "kv_manager is required for generate_from_boundaries. "
                 "Use a KVCacheManager (figtree.kv_cache_manager.KVCacheManager)."
             )
+        if faithful:
+            temperature = 0.0
+            top_k = 1
+            top_p = 1.0
+            repetition_penalty = 1.02
+            if source_tokens:
+                needed = int(source_tokens * 1.2) + 64
+                max_new_tokens = max(max_new_tokens, needed)
         device = self.device
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
