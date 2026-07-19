@@ -8,7 +8,6 @@ dist/
 build/
 .ruff_cache/
 .pytest_cache/
-*.figment/
 *.lance/
 figtree_kv/
 deltas/

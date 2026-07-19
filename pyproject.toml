@@ -4,9 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "figtree"
-version = "0.2.0"
+version = "0.2.1"
 description = "Figtree — grow coherent Images from Figments"
+readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Brian Mulkern"}]
+keywords = ["rag", "memory", "llm", "figment", "low-vram"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.0",
     "transformers>=4.40",
@@ -28,6 +40,13 @@ storage = [
     "lancedb>=0.15",
     "pyarrow>=14.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/otherdrums/figtree"
+Repository = "https://github.com/otherdrums/figtree"
+
+[project.scripts]
+figtree = "figtree.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["figtree*"]

@@ -55,7 +55,7 @@ def main():
     print("\nIngesting text into LanceDB figments...")
     figments = ingest_text_to_figments(
         model=model, tokenizer=tokenizer, text=TEXT,
-        output_dir=None, source_id="test_source", trust=0.95,
+        source_id="test_source", trust=0.95,
         store=store, kv_manager=kv_manager, compute_kv=False,
     )
     print(f"Created {len(figments)} figments in {STORE_URI}")
@@ -109,6 +109,27 @@ def main():
         f"{result_bd['num_tokens_total']} K/V tokens; "
         f"entities text={text_hits} boundary={bd_hits})."
     )
+
+    # Flawless-recall verification: faithful decode + source-sized budget +
+    # enumeration prompt (E1+E2) must reproduce every checkable atom (130, 2,700)
+    # in a single pass, so the verify-and-patch loop stays inert (patch_attempts==0).
+    all_atomic = [f for f in atomic_figments if not f.is_image() and not f.is_trust_assertion()]
+    recall_res = gen.generate_with_recall(
+        figments=all_atomic,
+        prompt=(
+            "List EVERY figure from the source verbatim as a bullet list: each "
+            "number, percent, year, and named entity. Do not summarize. Include "
+            "all of them. What happened at Davos?"
+        ),
+        source_texts=[TEXT],
+        max_new_tokens=200,
+    )
+    print(f"Recall score: {recall_res['recall_score']:.2f} "
+          f"(missing: {recall_res['missing_atoms']}, patches: {recall_res.get('patch_attempts', 0)})")
+    assert recall_res["recall_score"] >= 1.0, \
+        f"Recall not flawless: missing {recall_res['missing_atoms']}"
+    assert recall_res.get("patch_attempts", 0) == 0, \
+        "Verify-and-patch loop triggered; E1+E2 should make it inert"
 
     # Graph + persisted trust via store (idempotent).
     print("\nBuilding graph...")

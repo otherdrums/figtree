@@ -4,13 +4,17 @@
 
 Everything is a **Figment**. Images are figments containing other figments. Trust scores are figments. Graph edges are figments. Even the system itself is represented as figments.
 
-Figments are stored as:
-- **boundary.npy** — (hidden_size,) float32, ~10 KB. Compressed representation for retrieval and deduplication.
-- **boundaries.npy** — (num_layers, hidden_size) float32, ~360 KB. Per-layer hidden states for all layers.
-- **boundary_emb.npy** — (hidden_size,) float32. Last-token embedding.
-- **kv_cache.npy** — (num_layers, seq_len, 2, kv_dim) float32, ~2.8 MB per 20-token figment. Pre-computed unrotated K/V for every token at every layer.
-- **text.txt** — Natural language statement. Used for text-based generation fallback.
-- **manifest.json** — Metadata (children, sources, trust, edge_type).
+Figments are stored in a **LanceDB table** (see `figtree/lancedb_store.py`). The lightweight
+row carries:
+- **boundary** — (hidden_size,) float32, ~10 KB. Compressed vector for ANN retrieval and dedup.
+- **boundaries** — (num_layers, hidden_size) float32, ~360 KB. Per-layer hidden states (all layers).
+- **boundary_emb** — (hidden_size,) float32. Last-token embedding.
+- **text** — Natural language statement. Used for text-based generation and lazy K/V recompute.
+- **meta_json** — Metadata (children, sources, trust, edge_type, kv_uri, …), zstd-compressed.
+
+K/V caches (`kv_cache`, ~2.8 MB per 20-token figment before quantization) live **outside** the
+row as external quantized blobs addressed by `kv_uri`, managed by `KVCacheManager` (lazy by
+default; eager via `compute_kv=True`). The legacy `.figment/` directory format has been removed.
 
 ## Build / Test / Lint
 
@@ -41,6 +45,8 @@ figtree/
 ├── graph.py            # Edges/trust as figments + source-based credibility
 ├── lancedb_store.py    # LanceDB store (compression + object storage)
 ├── kv_cache_manager.py # K/V materialization: lazy/eager, quantized, tiered
+├── summarize.py        # Hierarchical figments: summarized image boundaries
+├── cli.py              # Typer CLI: ingest/generate/graph/benchmark/compare
 └── kernel/
     ├── boundary_project.cu   # CUDA kernel: boundaries @ W_k/W_v
     ├── boundary_project.py   # Python wrapper (4-bit dequant)
@@ -93,10 +99,12 @@ class Figment:
 
 ```python
 from figtree.ingest import ingest_text_to_figments
+from figtree.lancedb_store import connect
 
+store = connect("./figtree.lance")
 figments = ingest_text_to_figments(
     model, tokenizer, text,
-    output_dir=Path("./figments"),
+    store=store,
     source_id="reuters",
     trust=0.95,
 )
@@ -145,7 +153,8 @@ result = gen.generate_from_boundaries(
 5. Decode autoregressively
 
 **Boundary-based KV generation (`generate_from_boundaries`):**
-1. Loads pre-computed per-token unrotated K/V from disk (`kv_cache.npy`)
+1. Loads pre-computed per-token unrotated K/V from the `KVCacheManager`
+   (lazy: recomputed on demand; eager: loaded from the `kv_uri` blob)
 2. Applies RoPE based on global position IDs
 3. Inserts into `DynamicCache` directly — no forward pass for figment tokens
 4. Prompt prefill + decode proceed as usual
@@ -254,7 +263,7 @@ python3 -c "
 from figtree.figment import Figment
 from figtree.generate import FigmentGenerator
 gen = FigmentGenerator(model, tokenizer)
-result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
+result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
 "
 ```
 
@@ -268,9 +277,11 @@ result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
 
 4. **On-the-fly KV generation**: Instead of storing KV caches on disk (~90 MB per image), we regenerate them from text during generation. This trades computation for storage and keeps the system lightweight.
 
-5. **Pre-computed KV cache**: The `kv_cache.npy` stores per-token unrotated K/V for all layers, computed during ingestion with proper `input_layernorm`. RoPE is applied lazily during generation. This skips the forward pass for figment tokens (boundary path); wall-clock saving depends on GPU/context.
+5. **Pre-computed KV cache**: Per-token unrotated K/V for all layers is computed with proper `input_layernorm` and stored as an external quantized blob addressed by `kv_uri` (lazy by default; eager via `compute_kv=True`), managed by `KVCacheManager`. RoPE is applied lazily during generation. This skips the forward pass for figment tokens (boundary path); wall-clock saving depends on GPU/context.
 
 6. **Figment-centric graph**: All relationships (SUPPORTS, CONTRADICTS, TRUST) are first-class Figments with their own boundaries and text. During generation, the model can load meta-figments alongside content figments, enabling trust-aware reasoning through attention.
+
+7. **Flawless recall by verification** (`figtree/recall.py` + `FigmentGenerator.generate_with_recall`): per-source generation is *verified*, not hoped-for. After the first pass we extract checkable atoms (numbers, percentages, years, true acronyms) from the source text and diff them against the output. Any missing atom triggers a targeted greedy follow-up that states exactly the omitted figures; the loop retries up to twice. The Davos per-source task reaches recall_score = 1.0 (all figures reproduced). This makes recall correct by construction rather than by chance — and the score is reported so callers can assert it.
 
 ## Known Limitations
 
@@ -278,14 +289,23 @@ result = gen.generate_from_boundaries(figments, prompt, cache_dir='./davos')
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB headroom. Works for 300–500 token contexts. For longer contexts, use Qwen3-2B or larger GPU.
 
-3. **kv_cache.npy storage**: ~2.8 MB per 20-token figment, but now lives as an
-   external quantized blob (default lazy — not persisted at ingest). In LanceDB
-   the lightweight row is ~10 KB (boundary + text + metadata, compressed). 100
-   figments ≈ 1 MB in the store; K/V only materializes on demand.
+3. **External K/V storage**: ~2.8 MB per 20-token figment before quantization,
+   but lives as an external quantized blob (default lazy — not persisted at ingest).
+   In LanceDB the lightweight row is ~10 KB (boundary + text + metadata, compressed).
+   100 figments ≈ 1 MB in the store; K/V only materializes on demand.
 
-6. **`.figment/` layout superseded**: raw `.figment/` directories are no longer
-   used; all new code reads/writes the LanceDB store. `Figment.save`/`Figment.load`
-   are retained only for ad-hoc debugging.
+6. **`.figment/` format removed**: the legacy directory layout and `Figment.save`/
+   `Figment.load` are gone; all code reads/writes the LanceDB store. `store` is
+   required at ingest/graph time.
+
+7. **Conventional RAG baseline exists**: `examples/rag_baseline_davos.py` +
+   `examples/davos_eval.py` compare Figtree against top-k cosine retrieval +
+   generate on the same Davos task (fidelity, contradiction awareness, VRAM,
+   latency) via `figtree compare`.
+
+8. **Hierarchical figments are opt-in**: pass `summarize_images=True` to ingestion
+   to give an Image its own summarized `boundary` (`figtree/summarize.py`);
+   otherwise the Image boundary copies its first child. Opt-in protects low-VRAM users.
 
 4. **Per-source recall is verbatim-grounded; cross-source synthesis is model-generated**. QUERY 1/4 (per-source) reproduce each narrative's figures faithfully. The trust-aware QUERY 2/3 synthesize across sources via the LLM; to avoid fabricated agreement the demo grounds the prompt with `analyze_sources` relationships (`related`/`agreeing`/`contradicting`) and instructs the model to only state facts present in ≥2 source texts. Even so, the small model can under-describe disagreements.
 

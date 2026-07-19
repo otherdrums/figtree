@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import gc
 import time
-from pathlib import Path
 
-import numpy as np
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from transformers.cache_utils import DynamicCache
@@ -48,7 +46,27 @@ class FigmentGenerator:
         top_k: int = 50,
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
+        faithful: bool = False,
+        source_tokens: int | None = None,
     ) -> dict:
+        """Generate from figments by generating KV caches on-the-fly.
+
+        ``faithful`` selects decode settings for factual recall: greedy sampling
+        (``temperature=0``) with a near-neutral ``repetition_penalty`` so rare
+        tokens like numbers are not suppressed. When ``faithful`` is set and
+        ``source_tokens`` is provided, the generation budget is raised to at least
+        ~1.2x the source length (plus slack) so the model cannot run out of room
+        before re-verbalizing every figure.
+        """
+        if faithful:
+            temperature = 0.0
+            top_k = 1
+            top_p = 1.0
+            repetition_penalty = 1.02
+            if source_tokens:
+                needed = int(source_tokens * 1.2) + 64
+                max_new_tokens = max(max_new_tokens, needed)
+
         device = self.device
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
@@ -166,6 +184,74 @@ class FigmentGenerator:
         }
 
 
+    def generate_with_recall(
+        self,
+        figments: list[Figment],
+        prompt: str,
+        source_texts: list[str] | None = None,
+        max_new_tokens: int = 400,
+        recall_max_new_tokens: int = 150,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.15,
+    ) -> dict:
+        """Generate, then verify recall against ``source_texts`` and patch gaps.
+
+        This is a *transitional* correctness net: the primary recall guarantee
+        comes from faithful decoding (greedy, low repetition) and a source-sized
+        budget in :meth:`generate`. Any atoms still missing after the first pass
+        trigger a targeted greedy follow-up. ``recall_score`` / ``missing_atoms``
+        / ``patch_attempts`` are reported so callers can confirm the net is inert
+        (and eventually be removed).
+        """
+        from figtree.recall import build_recall_prompt, missing_atoms, recall_score
+
+        source_tokens = None
+        if source_texts:
+            source_tokens = sum(
+                len(self.tokenizer.encode(t, add_special_tokens=False))
+                for t in source_texts
+            )
+
+        result = self.generate(
+            figments=figments, prompt=prompt, max_new_tokens=max_new_tokens,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            faithful=True, source_tokens=source_tokens,
+        )
+        text = result["generated_text"]
+
+        if not source_texts:
+            result["recall_score"] = None
+            result["missing_atoms"] = []
+            result["patch_attempts"] = 0
+            return result
+
+        source_blob = "\n".join(source_texts)
+        miss = missing_atoms(source_blob, text)
+        attempt = 0
+        while miss and attempt < 2:
+            attempt += 1
+            recall_prompt = (
+                f"{prompt}\n\n{build_recall_prompt(miss)}"
+            )
+            patch = self.generate(
+                figments=figments, prompt=recall_prompt,
+                max_new_tokens=recall_max_new_tokens,
+                temperature=0.0, top_k=1, top_p=1.0,
+                repetition_penalty=1.02,
+            )
+            text = f"{text.strip()}\n\n{_strip_lead_in(patch['generated_text'])}".strip()
+            result["generated_text"] = text
+            result["num_tokens"] = result["num_tokens"] + patch["num_tokens"]
+            miss = missing_atoms(source_blob, text)
+
+        result["recall_score"] = recall_score(source_blob, text)
+        result["missing_atoms"] = miss
+        result["patch_attempts"] = attempt
+        return result
+
     def generate_from_boundaries(
         self,
         figments: list[Figment],
@@ -176,15 +262,30 @@ class FigmentGenerator:
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
         kv_manager=None,
-        cache_dir: str = "./figments",
+        faithful: bool = False,
+        source_tokens: int | None = None,
     ) -> dict:
         """Generate using per-token cached K/V.
 
         K/V is obtained from ``kv_manager.materialize`` (LanceDB-backed, lazy by
         default — recomputes on demand; eager if blobs were persisted at ingest).
-        For backward compatibility, if ``kv_manager`` is None and ``cache_dir`` is
-        provided, K/V is loaded from ``cache_dir/<id>.figment/kv_cache.npy``.
+        ``kv_manager`` is required for boundary-based generation. ``faithful`` and
+        ``source_tokens`` behave as in :meth:`generate` (greedy decode + budget
+        sized from the source length for factual recall).
         """
+        if kv_manager is None:
+            raise ValueError(
+                "kv_manager is required for generate_from_boundaries. "
+                "Use a KVCacheManager (figtree.kv_cache_manager.KVCacheManager)."
+            )
+        if faithful:
+            temperature = 0.0
+            top_k = 1
+            top_p = 1.0
+            repetition_penalty = 1.02
+            if source_tokens:
+                needed = int(source_tokens * 1.2) + 64
+                max_new_tokens = max(max_new_tokens, needed)
         device = self.device
         embed = self.model.get_input_embeddings()
         lm_head = self.model.lm_head
@@ -198,27 +299,12 @@ class FigmentGenerator:
         all_k: list[torch.Tensor] = []
         all_v: list[torch.Tensor] = []
 
-        if kv_manager is not None:
-            kv_map = kv_manager.materialize(figments)
-            for fig in figments:
-                kv = kv_map[fig.figment_id]
-                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-                all_k.append(kv_t[:, :, 0, :])
-                all_v.append(kv_t[:, :, 1, :])
-        else:
-            cache_root = Path(cache_dir)
-            for fig in figments:
-                fdir = cache_root / f"{fig.figment_id}.figment"
-                kv_path = fdir / "kv_cache.npy"
-                if not kv_path.exists():
-                    raise FileNotFoundError(
-                        f"No kv_cache.npy for figment {fig.figment_id[:12]}... "
-                        f"Re-ingest the text or use generate() instead."
-                    )
-                kv = np.load(str(kv_path))
-                kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
-                all_k.append(kv_t[:, :, 0, :])
-                all_v.append(kv_t[:, :, 1, :])
+        kv_map = kv_manager.materialize(figments)
+        for fig in figments:
+            kv = kv_map[fig.figment_id]
+            kv_t = torch.from_numpy(kv).to(device=device, dtype=self.dtype)
+            all_k.append(kv_t[:, :, 0, :])
+            all_v.append(kv_t[:, :, 1, :])
 
         total_tokens = sum(k.shape[1] for k in all_k)
 
@@ -321,6 +407,30 @@ def _rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _strip_lead_in(text: str) -> str:
+    """Trim a prompted instruction echo from a patched generation.
+
+    The recall follow-up prompt ends with an imperative ("Restate each with its
+    exact figure or name."). If the model echoes that instruction, drop it so the
+    appended facts read cleanly.
+    """
+    markers = (
+        "restate each with its exact figure",
+        "also explicitly state the following",
+        "here are the facts",
+        "certainly",
+    )
+    low = text.lower()
+    for m in markers:
+        idx = low.find(m)
+        if idx != -1:
+            # Cut from the marker backwards to the start of its sentence.
+            start = low.rfind(".", 0, idx)
+            start = 0 if start == -1 else start + 1
+            return text[start:].strip()
+    return text.strip()
 
 
 def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):

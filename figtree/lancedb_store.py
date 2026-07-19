@@ -1,7 +1,6 @@
 """LanceDB-backed storage for Figments.
 
-Replaces the raw ``.figment/`` filesystem layout with a LanceDB table. This
-enables:
+Figments are persisted as rows in a LanceDB table. This enables:
 
 - Compression (zstd for text/metadata, lz4 for hot columns, Lance's automatic
   dictionary/FSST encodings) configured at table creation.
