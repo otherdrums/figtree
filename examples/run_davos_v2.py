@@ -52,6 +52,10 @@ CROSS_PROMPT = (
     "summarize. Include all of them. {query}"
 )
 
+# Sources longer than this (in tokens) switch from a single faithful pass to
+# per-span enumerated generation so every figure stays in a focused window.
+ENUMERATE_TOKEN_THRESHOLD = 600
+
 
 def banner(title: str, dim: str = ""):
     console.print()
@@ -189,10 +193,23 @@ def do_generate():
         prompt: str,
         max_new_tokens: int = 150,
         source_texts: list[str] | None = None,
+        kv_manager=None,
+        use_boundaries: bool = False,
     ):
         console.print(f"\n[bold]Prompt:[/bold] {prompt}")
         t0 = time.perf_counter()
-        if source_texts:
+        src_tok = (
+            sum(len(gen.tokenizer.encode(t, add_special_tokens=False))
+                for t in source_texts) if source_texts else 0
+        )
+        enumerated = bool(source_texts) and src_tok > ENUMERATE_TOKEN_THRESHOLD
+        if enumerated:
+            result = gen.generate_enumerated(
+                figments=figments, prompt=prompt, source_texts=source_texts,
+                max_new_tokens=max_new_tokens, use_boundaries=use_boundaries,
+                kv_manager=kv_manager,
+            )
+        elif source_texts:
             result = gen.generate_faithful(
                 figments=figments, prompt=prompt, source_texts=source_texts,
                 max_new_tokens=max_new_tokens,
@@ -252,29 +269,16 @@ def do_generate():
 
     # -- QUERY 4: Boundary-based generation (cached K/V, faithful recall) --
     console.print("\n[bold underline blue]── QUERY 4: Boundary-Based Generation (cached K/V) ──[/bold underline blue]")
-    from figtree.recall import missing_atoms, recall_score
     for key, figments in source_figments.items():
         source = SOURCES[key]
         console.print(f"\n[bold {source['color']}]── {source['name']} (trust={source['trust']}) ──[/bold {source['color']}]")
         try:
-            src_tokens = len(gen.tokenizer.encode(source_texts[key], add_special_tokens=False))
-            result_bd = gen.generate_from_boundaries(
-                figments=figments, prompt=RECOUNT_PROMPT,
-                max_new_tokens=400, kv_manager=kv_manager,
-                faithful=True, source_tokens=src_tokens,
+            run_query(
+                source["name"] + " (boundary-based)", figments,
+                RECOUNT_PROMPT, max_new_tokens=400,
+                source_texts=[source_texts[key]],
+                kv_manager=kv_manager, use_boundaries=True,
             )
-            score = recall_score(source_texts[key], result_bd["generated_text"])
-            console.print(f"\n[bold]Output ({result_bd['num_tokens']} tokens, {result_bd['elapsed']:.1f}s):[/bold]")
-            console.print(result_bd["generated_text"])
-            tag = "[bold green]FLAWLESS[/bold green]" if score >= 1.0 else "[bold yellow]gaps[/bold yellow]"
-            console.print(f"[dim]Boundary recall: {score:.2f} {tag}"
-                          + (f" — missing: {missing_atoms(source_texts[key], result_bd['generated_text'])}" if score < 1.0 else ""))
-            console.print()
-            with open(log_path, "a") as f:
-                f.write(f"── {source['name']} (boundary-based) ──\n")
-                f.write(f"Tokens: {result_bd['num_tokens']}, Elapsed: {result_bd['elapsed']:.1f}s\n")
-                f.write(f"Recall: {score:.2f}\n")
-                f.write(result_bd["generated_text"] + "\n\n")
         except FileNotFoundError as e:
             console.print(f"[yellow]Skipped: {e}[/yellow]")
 
@@ -378,10 +382,18 @@ def _run_trust_aware(
         f"Do not invent facts, dates, or agreements that are not in the text."
     )
 
-    result = gen.generate_faithful(
-        figments=all_relevant, prompt=grounded_prompt,
-        source_texts=relevant_source_texts, max_new_tokens=450,
-    )
+    src_tok = sum(len(gen.tokenizer.encode(t, add_special_tokens=False))
+                  for t in relevant_source_texts)
+    if relevant_source_texts and src_tok > ENUMERATE_TOKEN_THRESHOLD:
+        result = gen.generate_enumerated(
+            figments=all_relevant, prompt=grounded_prompt,
+            source_texts=relevant_source_texts, max_new_tokens=450,
+        )
+    else:
+        result = gen.generate_faithful(
+            figments=all_relevant, prompt=grounded_prompt,
+            source_texts=relevant_source_texts, max_new_tokens=450,
+        )
     console.print(f"\n[bold]Output ({result['num_tokens']} tokens):[/bold]")
     console.print(result["generated_text"])
     if result.get("recall_score") is not None:

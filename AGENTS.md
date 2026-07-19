@@ -283,6 +283,8 @@ result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
 
 7. **Flawless recall by construction** (`figtree/recall.py` + `FigmentGenerator.generate_faithful`): recall is guaranteed by faithful generation, not a verify-and-patch loop. The recall path uses greedy decoding (`temperature=0`, `top_k=1`, `top_p=1.0`, `repetition_penalty=1.02`) and a source-sized budget (≥1.2× source length) so the model cannot truncate before re-verbalizing every figure. `generate_faithful` attaches `recall_score` / `missing_atoms` for measurement only; no follow-up patch is performed. The Davos per-source task reaches `recall_score = 1.0` (all figures reproduced) in a single pass.
 
+   **Long sources (E3):** `FigmentGenerator.generate_enumerated` handles sources longer than a token threshold by splitting the source into overlapping spans (`_chunk_text`) and restating each span faithfully as a bullet list, then concatenating. Each figure sits in a focused generation window, so recall stays flawless even when a single 1.2×-budget pass would be too long. Works on both the text K/V path (`use_boundaries=False`, default) and the cached boundary K/V path (`use_boundaries=True`, requires `kv_manager`). Short sources fall through to the single-pass `generate_faithful` path unchanged.
+
 ## Known Limitations
 
 1. **Boundary-based generation is not a fixed speedup**: On the 3GB test GPU, text-based generation is ~50s and boundary-based ~58s for 4 sources × 400 tokens. The skipped forward pass is offset by KV-load + RoPE. The trade-off is disk storage (~2.8 MB/figment) vs recompute, not wall-clock.

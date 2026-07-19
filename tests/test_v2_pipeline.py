@@ -130,6 +130,34 @@ def main():
     assert recall_res["recall_score"] >= 1.0, \
         f"Recall not flawless: missing {recall_res['missing_atoms']}"
 
+    # Long-source enumerated generation (E3): a synthetic long source that forces
+    # chunking must still recall every atom. Distinct atoms per repeat so a chunk
+    # can't cheat by reusing earlier text.
+    if torch.cuda.is_available():
+        long_lines = []
+        for i in range(8):
+            long_lines.append(
+                f"Report section {i+1}: {130 + i} countries, "
+                f"{2700 + i*100} delegates, a {2 + i} trillion fund, "
+                f"and the {['WTO','IMF','OECD','UN','WHO','G20','BIS','EIB'][i]} met."
+            )
+        long_source = "\n".join(long_lines)
+        enum_res = gen.generate_enumerated(
+            figments=all_atomic,
+            prompt=(
+                "List EVERY figure from the source verbatim as a bullet list: each "
+                "number, percent, year, and named entity. Do not summarize."
+            ),
+            source_texts=[long_source],
+            max_new_tokens=400,
+            chunk_tokens=60,
+            overlap_tokens=10,
+        )
+        print(f"Enumerated recall: {enum_res['recall_score']:.2f} "
+              f"(missing: {enum_res['missing_atoms']}, enumerated={enum_res.get('enumerated')})")
+        assert enum_res["recall_score"] >= 1.0, \
+            f"Enumerated recall not flawless: missing {enum_res['missing_atoms']}"
+
     # Graph + persisted trust via store (idempotent).
     print("\nBuilding graph...")
     graph = Figtree(store.all(), store=store)

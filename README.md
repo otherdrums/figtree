@@ -179,8 +179,13 @@ not by a verify-and-patch loop. The recall path uses greedy decoding
 generation budget to at least ~1.2x the source length, so the model cannot run out
 of room before re-verbalizing every figure. `FigmentGenerator.generate_faithful`
 attaches `recall_score` / `missing_atoms` (from `figtree/recall.py`) for
-measurement only — no follow-up patch is performed. Per-source recall on the Davos
-task reaches `recall_score = 1.0`.
+ measurement only — no follow-up patch is performed. Per-source recall on the Davos
+ task reaches `recall_score = 1.0`.
+
+ For sources longer than a token threshold (default 600), `generate_enumerated`
+ splits the source into overlapping spans and restates each one faithfully, so
+ every figure stays in a focused generation window. Works on both the text and
+ cached-boundary K/V paths.
 
 **Boundary-based** (lazy K/V via `KVCacheManager`, skips per-figment forward pass):
 

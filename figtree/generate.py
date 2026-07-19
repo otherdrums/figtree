@@ -229,6 +229,118 @@ class FigmentGenerator:
             result["missing_atoms"] = []
         return result
 
+    def generate_enumerated(
+        self,
+        figments: list[Figment],
+        prompt: str,
+        source_texts: list[str] | None = None,
+        max_new_tokens: int = 400,
+        use_boundaries: bool = False,
+        kv_manager=None,
+        chunk_tokens: int = 350,
+        overlap_tokens: int = 40,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.15,
+    ) -> dict:
+        """Faithful generation for long sources via per-span enumerated restatement.
+
+        For short sources (or when ``source_texts`` is omitted) this delegates to
+        :meth:`generate_faithful` (or :meth:`generate_from_boundaries` when
+        ``use_boundaries`` is set) — a single faithful pass. For a long source, the
+        source is split into overlapping ``chunk_tokens`` spans; each span is
+        restated faithfully and verbatim as a short bullet list, and the spans are
+        concatenated. This keeps every figure inside a focused generation window so
+        recall stays flawless even when a single 1.2x-budget pass would be too long
+        or would drift before the final figures.
+
+        Works for both the text K/V path (``use_boundaries=False``) and the cached
+        boundary K/V path (``use_boundaries=True``, requires ``kv_manager``).
+        """
+        from figtree.recall import missing_atoms, recall_score
+
+        if not source_texts:
+            return self._enumerated_single(
+                figments, prompt, None, max_new_tokens, use_boundaries, kv_manager,
+                temperature, top_k, top_p, repetition_penalty,
+            )
+
+        source_blob = "\n".join(source_texts)
+        total_src_tokens = sum(
+            len(self.tokenizer.encode(t, add_special_tokens=False))
+            for t in source_texts
+        )
+
+        # Short source: single faithful pass (no chunking needed).
+        if total_src_tokens <= chunk_tokens:
+            return self._enumerated_single(
+                figments, prompt, source_texts, max_new_tokens, use_boundaries,
+                kv_manager, temperature, top_k, top_p, repetition_penalty,
+            )
+
+        parts: list[str] = []
+        total_gen_tokens = 0
+        for src in source_texts:
+            chunks = _chunk_text(self.tokenizer, src, chunk_tokens, overlap_tokens)
+            for chunk in chunks:
+                chunk_prompt = (
+                    f"{prompt}\n\n"
+                    f"Restate ONLY the facts in the following source excerpt, "
+                    f"verbatim, as a bullet list — every number, percent, year, and "
+                    f"named entity. Do not add or infer anything.\n\n"
+                    f"Excerpt:\n\"{chunk}\""
+                )
+                res = self._enumerated_single(
+                    figments, chunk_prompt, None,
+                    max(chunk_tokens, int(len(self.tokenizer.encode(chunk, add_special_tokens=False)) * 1.2) + 32),
+                    use_boundaries, kv_manager,
+                    temperature, top_k, top_p, repetition_penalty,
+                )
+                parts.append(res["generated_text"].strip())
+                total_gen_tokens += res["num_tokens"]
+
+        generated = "\n\n".join(p for p in parts if p)
+        return {
+            "generated_text": generated,
+            "num_tokens": total_gen_tokens,
+            "tokens_per_second": 0.0,
+            "elapsed": 0.0,
+            "num_figments": len(figments),
+            "enumerated": True,
+            "recall_score": recall_score(source_blob, generated),
+            "missing_atoms": missing_atoms(source_blob, generated),
+        }
+
+    def _enumerated_single(
+        self,
+        figments: list[Figment],
+        prompt: str,
+        source_texts: list[str] | None,
+        max_new_tokens: int,
+        use_boundaries: bool,
+        kv_manager,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> dict:
+        """Single-pass faithful generation used by :meth:`generate_enumerated`."""
+        if use_boundaries:
+            return self.generate_from_boundaries(
+                figments=figments, prompt=prompt, max_new_tokens=max_new_tokens,
+                kv_manager=kv_manager, faithful=True,
+                source_tokens=(
+                    sum(len(self.tokenizer.encode(t, add_special_tokens=False))
+                        for t in source_texts) if source_texts else None
+                ),
+            )
+        return self.generate_faithful(
+            figments=figments, prompt=prompt, source_texts=source_texts,
+            max_new_tokens=max_new_tokens, temperature=temperature,
+            top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
+        )
+
     def generate_from_boundaries(
         self,
         figments: list[Figment],
@@ -421,3 +533,31 @@ def _sample(logits, temperature, top_k, top_p, repetition_penalty=1.0, context=N
             probs = torch.zeros_like(probs).scatter_(0, si, sp)
     probs = probs / probs.sum()
     return torch.multinomial(probs, 1).item()
+
+
+def _chunk_text(tokenizer, text: str, chunk_tokens: int, overlap_tokens: int) -> list[str]:
+    """Split ``text`` into overlapping token windows of ~``chunk_tokens`` each.
+
+    Returns the decoded text of each window. Token boundaries may cut a word, but
+    the windows overlap by ``overlap_tokens`` so a cut figure still appears intact
+    in at least one window. Used by :meth:`FigmentGenerator.generate_enumerated`
+    to keep long sources inside a focused generation window.
+    """
+    if not text.strip():
+        return []
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) <= chunk_tokens:
+        return [text]
+    chunks: list[str] = []
+    step = max(1, chunk_tokens - overlap_tokens)
+    start = 0
+    while start < len(ids):
+        window = ids[start:start + chunk_tokens]
+        if not window:
+            break
+        chunks.append(tokenizer.decode(window, skip_special_tokens=True))
+        if start + chunk_tokens >= len(ids):
+            break
+        start += step
+    return chunks
+
