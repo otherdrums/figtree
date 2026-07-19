@@ -112,9 +112,10 @@ def main():
 
     # Flawless-recall verification: faithful decode + source-sized budget +
     # enumeration prompt (E1+E2) must reproduce every checkable atom (130, 2,700)
-    # in a single pass, so the verify-and-patch loop stays inert (patch_attempts==0).
+    # in a single pass. The verify-and-patch loop was removed once the faithful
+    # path proved flawless on its own, so recall must already be 1.0 with no patch.
     all_atomic = [f for f in atomic_figments if not f.is_image() and not f.is_trust_assertion()]
-    recall_res = gen.generate_with_recall(
+    recall_res = gen.generate_faithful(
         figments=all_atomic,
         prompt=(
             "List EVERY figure from the source verbatim as a bullet list: each "
@@ -125,11 +126,9 @@ def main():
         max_new_tokens=200,
     )
     print(f"Recall score: {recall_res['recall_score']:.2f} "
-          f"(missing: {recall_res['missing_atoms']}, patches: {recall_res.get('patch_attempts', 0)})")
+          f"(missing: {recall_res['missing_atoms']})")
     assert recall_res["recall_score"] >= 1.0, \
         f"Recall not flawless: missing {recall_res['missing_atoms']}"
-    assert recall_res.get("patch_attempts", 0) == 0, \
-        "Verify-and-patch loop triggered; E1+E2 should make it inert"
 
     # Graph + persisted trust via store (idempotent).
     print("\nBuilding graph...")

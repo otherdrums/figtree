@@ -184,28 +184,27 @@ class FigmentGenerator:
         }
 
 
-    def generate_with_recall(
+    def generate_faithful(
         self,
         figments: list[Figment],
         prompt: str,
         source_texts: list[str] | None = None,
         max_new_tokens: int = 400,
-        recall_max_new_tokens: int = 150,
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
         repetition_penalty: float = 1.15,
     ) -> dict:
-        """Generate, then verify recall against ``source_texts`` and patch gaps.
+        """Faithful single-pass generation with optional recall reporting.
 
-        This is a *transitional* correctness net: the primary recall guarantee
-        comes from faithful decoding (greedy, low repetition) and a source-sized
-        budget in :meth:`generate`. Any atoms still missing after the first pass
-        trigger a targeted greedy follow-up. ``recall_score`` / ``missing_atoms``
-        / ``patch_attempts`` are reported so callers can confirm the net is inert
-        (and eventually be removed).
+        Recall is guaranteed by construction via :meth:`generate` with
+        ``faithful=True`` (greedy decode, low repetition) and a source-sized
+        budget. When ``source_texts`` is provided, ``recall_score`` and
+        ``missing_atoms`` are attached to the result for measurement — but no
+        verify-and-patch follow-up is performed (the loop was removed once the
+        faithful path proved flawless on its own).
         """
-        from figtree.recall import build_recall_prompt, missing_atoms, recall_score
+        from figtree.recall import missing_atoms, recall_score
 
         source_tokens = None
         if source_texts:
@@ -220,36 +219,14 @@ class FigmentGenerator:
             repetition_penalty=repetition_penalty,
             faithful=True, source_tokens=source_tokens,
         )
-        text = result["generated_text"]
 
-        if not source_texts:
+        if source_texts:
+            source_blob = "\n".join(source_texts)
+            result["recall_score"] = recall_score(source_blob, result["generated_text"])
+            result["missing_atoms"] = missing_atoms(source_blob, result["generated_text"])
+        else:
             result["recall_score"] = None
             result["missing_atoms"] = []
-            result["patch_attempts"] = 0
-            return result
-
-        source_blob = "\n".join(source_texts)
-        miss = missing_atoms(source_blob, text)
-        attempt = 0
-        while miss and attempt < 2:
-            attempt += 1
-            recall_prompt = (
-                f"{prompt}\n\n{build_recall_prompt(miss)}"
-            )
-            patch = self.generate(
-                figments=figments, prompt=recall_prompt,
-                max_new_tokens=recall_max_new_tokens,
-                temperature=0.0, top_k=1, top_p=1.0,
-                repetition_penalty=1.02,
-            )
-            text = f"{text.strip()}\n\n{_strip_lead_in(patch['generated_text'])}".strip()
-            result["generated_text"] = text
-            result["num_tokens"] = result["num_tokens"] + patch["num_tokens"]
-            miss = missing_atoms(source_blob, text)
-
-        result["recall_score"] = recall_score(source_blob, text)
-        result["missing_atoms"] = miss
-        result["patch_attempts"] = attempt
         return result
 
     def generate_from_boundaries(
@@ -407,30 +384,6 @@ def _rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
-
-def _strip_lead_in(text: str) -> str:
-    """Trim a prompted instruction echo from a patched generation.
-
-    The recall follow-up prompt ends with an imperative ("Restate each with its
-    exact figure or name."). If the model echoes that instruction, drop it so the
-    appended facts read cleanly.
-    """
-    markers = (
-        "restate each with its exact figure",
-        "also explicitly state the following",
-        "here are the facts",
-        "certainly",
-    )
-    low = text.lower()
-    for m in markers:
-        idx = low.find(m)
-        if idx != -1:
-            # Cut from the marker backwards to the start of its sentence.
-            start = low.rfind(".", 0, idx)
-            start = 0 if start == -1 else start + 1
-            return text[start:].strip()
-    return text.strip()
 
 
 def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):

@@ -103,13 +103,3 @@ def recall_score(source_text: str, generated_text: str) -> float:
         return 1.0
     miss = missing_atoms(source_text, generated_text)
     return max(0.0, (len(src) - len(miss)) / len(src))
-
-
-def build_recall_prompt(missing: list[str]) -> str:
-    """Targeted follow-up that asks the model to state exactly the missing atoms."""
-    listing = "; ".join(missing)
-    return (
-        f"The following specific facts from the source were omitted from your "
-        f"answer. State each one exactly as it appears, with its precise figure "
-        f"or name: {listing}."
-    )

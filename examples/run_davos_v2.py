@@ -193,7 +193,7 @@ def do_generate():
         console.print(f"\n[bold]Prompt:[/bold] {prompt}")
         t0 = time.perf_counter()
         if source_texts:
-            result = gen.generate_with_recall(
+            result = gen.generate_faithful(
                 figments=figments, prompt=prompt, source_texts=source_texts,
                 max_new_tokens=max_new_tokens,
             )
@@ -378,7 +378,7 @@ def _run_trust_aware(
         f"Do not invent facts, dates, or agreements that are not in the text."
     )
 
-    result = gen.generate_with_recall(
+    result = gen.generate_faithful(
         figments=all_relevant, prompt=grounded_prompt,
         source_texts=relevant_source_texts, max_new_tokens=450,
     )
@@ -387,7 +387,7 @@ def _run_trust_aware(
     if result.get("recall_score") is not None:
         score = result["recall_score"]
         tag = "[bold green]FLAWLESS[/bold green]" if score >= 1.0 else "[bold yellow]gaps[/bold yellow]"
-        console.print(f"[dim]Recall: {score:.2f} {tag} (patches={result.get('patch_attempts', 0)})"
+        console.print(f"[dim]Recall: {score:.2f} {tag}"
                       + (f" — missing: {result['missing_atoms']}" if score < 1.0 else ""))
     console.print()
     with open(log_path, "a") as f:
@@ -395,7 +395,6 @@ def _run_trust_aware(
         f.write(f"Tokens: {result['num_tokens']}\n")
         if result.get("recall_score") is not None:
             f.write(f"Recall: {result['recall_score']:.2f} "
-                    f"patches={result.get('patch_attempts', 0)} "
                     f"missing={result['missing_atoms']}\n")
         f.write(result["generated_text"] + "\n\n")
 

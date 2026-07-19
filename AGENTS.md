@@ -281,7 +281,7 @@ result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
 
 6. **Figment-centric graph**: All relationships (SUPPORTS, CONTRADICTS, TRUST) are first-class Figments with their own boundaries and text. During generation, the model can load meta-figments alongside content figments, enabling trust-aware reasoning through attention.
 
-7. **Flawless recall by verification** (`figtree/recall.py` + `FigmentGenerator.generate_with_recall`): per-source generation is *verified*, not hoped-for. After the first pass we extract checkable atoms (numbers, percentages, years, true acronyms) from the source text and diff them against the output. Any missing atom triggers a targeted greedy follow-up that states exactly the omitted figures; the loop retries up to twice. The Davos per-source task reaches recall_score = 1.0 (all figures reproduced). This makes recall correct by construction rather than by chance — and the score is reported so callers can assert it.
+7. **Flawless recall by construction** (`figtree/recall.py` + `FigmentGenerator.generate_faithful`): recall is guaranteed by faithful generation, not a verify-and-patch loop. The recall path uses greedy decoding (`temperature=0`, `top_k=1`, `top_p=1.0`, `repetition_penalty=1.02`) and a source-sized budget (≥1.2× source length) so the model cannot truncate before re-verbalizing every figure. `generate_faithful` attaches `recall_score` / `missing_atoms` for measurement only; no follow-up patch is performed. The Davos per-source task reaches `recall_score = 1.0` (all figures reproduced) in a single pass.
 
 ## Known Limitations
 

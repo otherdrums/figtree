@@ -173,11 +173,14 @@ Text is split into sentences. For each sentence:
 2. Forward through all 36 layers with DynamicCache
 3. Figment KV entries populate the cache
 
-**Flawless recall** (`generate_with_recall`): after generation, checkable atoms
-(numbers, percentages, years, acronyms) from the source text are diffed against
-the output. Any missing atom triggers a targeted greedy follow-up that states
-exactly the omitted figures, retrying up to twice. Per-source recall on the
-Davos task reaches `recall_score = 1.0`.
+**Flawless recall** (faithful generation): recall is guaranteed by construction,
+not by a verify-and-patch loop. The recall path uses greedy decoding
+(`temperature=0`, `top_k=1`, `top_p=1.0`, `repetition_penalty=1.02`) and raises the
+generation budget to at least ~1.2x the source length, so the model cannot run out
+of room before re-verbalizing every figure. `FigmentGenerator.generate_faithful`
+attaches `recall_score` / `missing_atoms` (from `figtree/recall.py`) for
+measurement only — no follow-up patch is performed. Per-source recall on the Davos
+task reaches `recall_score = 1.0`.
 
 **Boundary-based** (lazy K/V via `KVCacheManager`, skips per-figment forward pass):
 

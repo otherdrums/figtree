@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from figtree.recall import (
-    build_recall_prompt,
     extract_atoms,
     missing_atoms,
     recall_score,
@@ -38,11 +37,6 @@ def test_recall_score_perfect_when_all_present():
 def test_recall_score_zero_when_all_missing():
     source = "2,700 delegates met."
     assert recall_score(source, "nothing relevant") == 0.0
-
-
-def test_build_recall_prompt_lists_missing():
-    p = build_recall_prompt(["2700", "2 trillion"])
-    assert "2700" in p and "2 trillion" in p
 
 
 def test_numeric_core_match_counts_as_recalled():
