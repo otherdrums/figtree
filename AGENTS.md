@@ -232,8 +232,8 @@ python3 examples/davos_benchmark_v2.py
 | Phase | Time | Throughput |
 |-------|------|------------|
 | Ingestion | ~18s | ~38 atomic figments |
-| Generation (text) | ~50s | 4 sources × 400 tokens |
-| Generation (boundary) | ~58s | 4 sources × 400 tokens |
+| Generation (text) | ~50s | 3 narratives × 400 tokens |
+| Generation (boundary) | ~58s | 3 narratives × 400 tokens |
 | Graph | <1s | 3 sources, persisted trust |
 | **Total** | **~2 min** | |
 
@@ -287,7 +287,7 @@ result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
 
 ## Known Limitations
 
-1. **Boundary-based generation is not a fixed speedup**: On the 3GB test GPU, text-based generation is ~50s and boundary-based ~58s for 4 sources × 400 tokens. The skipped forward pass is offset by KV-load + RoPE. The trade-off is disk storage (~2.8 MB/figment) vs recompute, not wall-clock.
+1. **Boundary-based generation is not a fixed speedup**: On the 3GB test GPU, text-based generation is ~50s and boundary-based ~58s for 3 narratives × 400 tokens. The skipped forward pass is offset by KV-load + RoPE. The trade-off is disk storage (~2.8 MB/figment) vs recompute, not wall-clock.
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB headroom. Works for 300–500 token contexts. For longer contexts, use Qwen3-2B or larger GPU.
 

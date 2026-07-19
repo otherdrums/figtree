@@ -21,6 +21,13 @@ A Figment persists as a **row in a LanceDB table** — the table is the unit of
 storage, with vector columns for similarity search and compressed columns for
 text/metadata. K/V caches live outside the row, addressed by `kv_uri`.
 
+The file-style names in the table above (`text.txt`, `boundary.npy`,
+`boundaries.npy`, `kv_cache`, `manifest`) describe the conceptual payload of a
+figment; in the LanceDB layout the text/metadata become compressed string
+columns, the boundary/boundaries/boundary_emb become vector/blob columns, and
+the K/V cache becomes an external quantized blob. Same content, different
+physical representation.
+
 ### What can be a Figment?
 
 **An Image** is a Figment with children:
@@ -101,8 +108,8 @@ Query → ANN retrieve by boundary → KVCacheManager (lazy recompute or blob) �
 | Phase | Time | Output |
 |-------|------|--------|
 | Ingestion | ~18s | ~38 atomic figments, ~2.8 MB KV each |
-| Generation (text-based) | ~50s | 4 sources × 400 tokens |
-| Generation (boundary-based) | ~58s | 4 sources × 400 tokens |
+| Generation (text-based) | ~50s | 3 narratives × 400 tokens |
+| Generation (boundary-based) | ~58s | 3 narratives × 400 tokens |
 | Graph | <1s | 3 sources, persisted trust figments |
 | **Total** | **~2 min** | |
 
@@ -254,7 +261,9 @@ Trust is **source-based and mutable**, not a fixed graph attribute:
 - Figment texts are concatenated with `\n\n` separators during ingestion; the
   boundary path replays the exact same per-figment K/V slices, so
   boundary-based output matches text-based output token-for-token in content.
-- A `repetition_penalty` (1.15) is applied during sampling to reduce looping.
+- A `repetition_penalty` of 1.15 is applied on the default sampling path to reduce
+  looping; the faithful recall path lowers it to 1.02 so rare tokens (numbers,
+  acronyms) are not suppressed.
 
 ## Critical Technical Details
 
@@ -302,8 +311,11 @@ python3 examples/davos_benchmark_v2.py
 
 ## Known Limitations
 
-1. **kv_cache.npy storage**: ~2.8 MB per 20-token figment. 100 figments = ~280 MB.
-   Manageable on modern drives but not as compact as boundary-only storage.
+ 1. **kv_cache blob storage**: ~2.8 MB per 20-token figment (before quantization),
+    held externally as a quantized blob addressed by `kv_uri` — not inside the
+    LanceDB row. 100 figments ≈ ~280 MB (lazy by default, so not materialized
+    until needed). Manageable on modern drives but not as compact as boundary-only
+    storage.
 
 2. **GPU memory constrained**: Qwen3-4B (3.4GB) on 3GB GPU leaves ~1.1GB
    headroom. Works for 300–500 token contexts. For longer context or larger

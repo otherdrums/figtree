@@ -14,9 +14,14 @@ Run:
 
 import os
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+# Make sibling example scripts (e.g. davos_eval) importable whether run as a
+# script (cwd=examples) or imported as a module (e.g. via `figtree compare`).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 

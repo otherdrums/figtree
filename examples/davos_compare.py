@@ -9,6 +9,13 @@ Run:
     python3 examples/davos_compare.py
 """
 
+import sys
+from pathlib import Path
+
+# Make sibling example scripts importable whether run as a script (cwd=examples)
+# or imported as a module (e.g. via `figtree compare` from the repo root).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from rich.console import Console
 
 from rag_baseline_davos import main as rag_main
