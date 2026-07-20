@@ -123,7 +123,7 @@ class FigmentStore:
         if self._table is not None:
             return
         schema = _schema_for(hidden_size)
-        if self.table_name in self.db.table_names():
+        if self._has_table():
             self._table = self.db.open_table(self.table_name)
             vec_field = self._table.schema.field("boundary")
             existing = vec_field.type.list_size
@@ -139,10 +139,20 @@ class FigmentStore:
             )
             self._hidden_size = hidden_size
 
+    def _has_table(self) -> bool:
+        try:
+            names = self.db.table_names()
+        except Exception:
+            try:
+                names = [t.name for t in self.db.list_tables()]
+            except Exception:
+                names = []
+        return self.table_name in names
+
     @property
     def table(self):
         if self._table is None:
-            if self.table_name in self.db.table_names():
+            if self._has_table():
                 self._table = self.db.open_table(self.table_name)
             else:
                 raise RuntimeError(
@@ -214,6 +224,11 @@ class FigmentStore:
 
     # -- CRUD ------------------------------------------------------------ #
     def upsert(self, figments: list[Figment], hidden_size: int | None = None) -> None:
+        """Insert or overwrite figments in the store.
+
+        An existing ``figment_id`` is overwritten (delete + re-add) so the
+        operation is idempotent. ``hidden_size`` is inferred when omitted.
+        """
         if not figments:
             return
         # Resolve the model hidden size: prefer an explicit arg, else the size
@@ -237,9 +252,13 @@ class FigmentStore:
             self._table.add([rec], mode="append")
 
     def upsert_one(self, f: Figment, hidden_size: int | None = None) -> None:
+        """Convenience wrapper to upsert a single figment."""
         self.upsert([f], hidden_size=hidden_size)
 
     def get(self, figment_id: str) -> Figment | None:
+        """Return the figment with ``figment_id``, or ``None`` if absent."""
+        if not self._has_table():
+            return None
         tbl = self.table
         rows = tbl.search().where(f"figment_id = '{figment_id}'").limit(1).to_list()
         if not rows:
@@ -247,9 +266,15 @@ class FigmentStore:
         return self._from_record(rows[0])
 
     def delete(self, figment_id: str) -> None:
+        """Delete the figment with ``figment_id`` (no-op if absent)."""
+        if not self._has_table():
+            return
         self.table.delete(f"figment_id = '{figment_id}'")
 
     def all(self) -> list[Figment]:
+        """Return every figment currently stored (empty list if none)."""
+        if not self._has_table():
+            return []
         tbl = self.table
         return [self._from_record(r) for r in tbl.search().select(
             ["figment_id", "text", "source_id", "edge_type", "trust", "is_image",
@@ -258,6 +283,9 @@ class FigmentStore:
         ).to_list()]
 
     def by_source(self, source_id: str) -> list[Figment]:
+        """Return all figments whose ``source_id`` matches (empty if none)."""
+        if not self._has_table():
+            return []
         rows = (
             self.table.search()
             .where(f"source_id = '{source_id}'")
@@ -267,6 +295,8 @@ class FigmentStore:
 
     def search(self, vector: np.ndarray, k: int = 8) -> list[tuple[Figment, float]]:
         """ANN search by boundary vector; returns (figment, score) pairs."""
+        if not self._has_table():
+            return []
         tbl = self.table
         vec = np.asarray(vector, dtype=np.float32).tolist()
         rows = tbl.search(vec).limit(k).to_list()
@@ -276,7 +306,14 @@ class FigmentStore:
         return out
 
     def count(self) -> int:
-        return self.table.count_rows()
+        """Return the number of figments stored (0 if none).
+
+        Uses a bounded search rather than ``count_rows()`` because LanceDB's
+        cached row count can lag an immediate ``add`` in this version.
+        """
+        if not self._has_table():
+            return 0
+        return len(self.table.search().select(["figment_id"]).to_list())
 
     def set_kv_ref(self, figment_id: str, kv_uri: str, hidden_size: int) -> None:
         """Record that this figment's K/V lives at ``kv_uri``."""

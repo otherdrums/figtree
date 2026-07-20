@@ -82,6 +82,49 @@ class Figment:
         """True if this figment represents a trust score."""
         return self.meta.get("edge_type") == "trust"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain, JSON-friendly dict (independent of the store).
+
+        Arrays become nested lists; use :meth:`from_dict` to reconstruct.
+        """
+        return {
+            "figment_id": self.figment_id,
+            "text": self.text,
+            "boundary": self.boundary.astype(np.float32).tolist(),
+            "boundaries": (
+                self.boundaries.astype(np.float32).tolist() if self.boundaries is not None else None
+            ),
+            "boundary_emb": (
+                self.boundary_emb.astype(np.float32).tolist() if self.boundary_emb is not None else None
+            ),
+            "meta": dict(self.meta),
+            "children": list(self.children),
+            "sources": list(self.sources),
+            "trust": float(self.trust),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Figment":
+        """Reconstruct a Figment from :meth:`to_dict` output."""
+        boundary = np.asarray(d["boundary"], dtype=np.float32)
+        boundaries = d.get("boundaries")
+        boundary_emb = d.get("boundary_emb")
+        return cls(
+            figment_id=d["figment_id"],
+            text=d["text"],
+            boundary=boundary,
+            boundaries=(
+                np.asarray(boundaries, dtype=np.float32) if boundaries is not None else None
+            ),
+            boundary_emb=(
+                np.asarray(boundary_emb, dtype=np.float32) if boundary_emb is not None else None
+            ),
+            meta=dict(d.get("meta", {})),
+            children=list(d.get("children", [])),
+            sources=list(d.get("sources", [])),
+            trust=float(d.get("trust", 0.5)),
+        )
+
     def __repr__(self) -> str:
         kind = "image" if self.is_image() else "edge" if self.is_edge() else "atomic"
         return f"Figment({kind}, id={self.figment_id[:8]}..., trust={self.trust:.2f}, text={self.text[:40]!r})"

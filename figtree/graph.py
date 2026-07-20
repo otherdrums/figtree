@@ -51,6 +51,7 @@ class Figtree:
         self._reindex_sources()
 
     def add_figment(self, figment: Figment) -> None:
+        """Register a figment in the in-memory index (keyed by figment_id)."""
         self.figments[figment.figment_id] = figment
 
     def _reindex_sources(self) -> None:

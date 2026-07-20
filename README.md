@@ -118,6 +118,56 @@ K/V, but on this small GPU the KV-load + RoPE cost roughly cancels the saving, s
 wall-clock is comparable to text-based generation. The benefit is storage/compute
 trade-off, not a fixed speedup.
 
+## Using FigTree as a library
+
+FigTree is a library. A downstream application imports the public surface,
+ingests text, stores/retrieves figments, generates, and runs trust propagation —
+without any demo or news-specific code:
+
+```python
+from figtree import (
+    FigmentGenerator, connect, ingest_text_to_figments, load_model,
+)
+
+model, tokenizer = load_model()                      # any causal LM
+store = connect("./figments.lance")                   # LanceDB-backed
+figments = ingest_text_to_figments(
+    model, tokenizer, text, source_id="doc-1", store=store, trust=0.9,
+)
+gen = FigmentGenerator(model, tokenizer)
+out = gen.generate_faithful(
+    figments=[f for f in figments if not f.is_image()],
+    prompt="List every figure from the text verbatim.",
+    source_texts=[text], max_new_tokens=200,
+)
+print(out["generated_text"], "recall=", out["recall_score"])
+```
+
+Key public symbols (see `figtree/__init__.py`):
+
+| Symbol | Purpose |
+|--------|---------|
+| `Figment` | The universal primitive (text + boundary + meta). `to_dict()`/`from_dict()` for serialization. |
+| `connect(uri)` / `FigmentStore` | Open a LanceDB-backed store; `upsert`, `get`, `all`, `by_source`, `search` (ANN by boundary), `count`. |
+| `ingest_text_to_figments` | Text → atomic figments with boundaries + optional K/V capture. |
+| `FigmentGenerator` | `generate` (text), `generate_faithful` (greedy, recall-by-construction), `generate_enumerated` (long sources), `generate_from_boundaries` (cached K/V). |
+| `Figtree` | Graph ops: `deduplicate`, `create_edges`, `analyze_sources`, `propagate_trust` (idempotent, store-persistent), `build_trust_aware_context`. |
+| `KVCacheManager` | External quantized K/V blobs (lazy/eager, local or `s3://`). |
+| `load_model(model_id, device, dtype)` | Convenience loader; defaults to `unsloth/Qwen3-4B-bnb-4bit`. |
+| `extract_atoms` / `missing_atoms` / `recall_score` | Atom-level recall measurement. |
+
+A longer, domain-neutral walkthrough lives in
+[`examples/library_usage.py`](examples/library_usage.py).
+
+### Scope
+
+FigTree provides the **Figment substrate**: ingestion, storage, retrieval,
+dual-path generation, and source-based trust propagation. It deliberately does
+**not** include news-specific logic, UI, continuous online learning, cryptography,
+or parallel orchestration. Those capabilities — a news aggregator, dreaming /
+consolidation, prompt-inclusive learning, and encrypted/integrity-protected trust
+— are built as **separate applications that depend on FigTree**, not inside it.
+
 ## Architecture
 
 ```
@@ -157,6 +207,14 @@ blob addressed by `kv_uri`:
 
 Default: `unsloth/Qwen3-4B-bnb-4bit` (36 layers, hidden_size=2560, 4-bit quantized)
 Tested on: Quadro T1000 (3GB VRAM)
+
+FigTree is **model-agnostic**: `ingest_text_to_figments` and
+`FigmentGenerator` accept any HuggingFace causal LM plus its tokenizer, and
+`load_model(model_id, device, dtype)` is a convenience loader (defaults to the
+reference model; pass another id to use a different model). The CUDA boundary
+kernel dequantizes 4-bit weights on the fly, so both dense and 4-bit models work.
+Hardware assumptions and VRAM limits are documented under
+[Known Limitations](#known-limitations).
 
 ## How It Works
 

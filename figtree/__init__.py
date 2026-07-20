@@ -17,8 +17,9 @@ from figtree.figment import Figment
 from figtree.ingest import ingest_text_to_figments
 from figtree.generate import FigmentGenerator
 from figtree.graph import Figtree
-from figtree.lancedb_store import connect
+from figtree.lancedb_store import FigmentStore, connect
 from figtree.kv_cache_manager import KVCacheManager
+from figtree.model import load_model
 from figtree.recall import extract_atoms, missing_atoms, recall_score
 from figtree.summarize import summarize_image
 
@@ -36,9 +37,11 @@ __all__ = [
     "Figment",
     "FigmentGenerator",
     "Figtree",
+    "FigmentStore",
     "ingest_text_to_figments",
     "connect",
     "KVCacheManager",
+    "load_model",
     "extract_atoms",
     "missing_atoms",
     "recall_score",
