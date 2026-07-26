@@ -69,7 +69,7 @@ def main():
     orig_map = {f.figment_id: f for f in figments if f.kind == "sentence"}
     assert set(orig_map) == {f.figment_id for f in sentence_figments}, \
         "Figment id set mismatch after store round-trip"
-    for fid, loaded in zip(orig_map, atomic_figments):
+    for fid, loaded in zip(orig_map, sentence_figments):
         assert orig_map[fid].boundary.shape == loaded.boundary.shape
         assert orig_map[fid].boundary.dtype == loaded.boundary.dtype
 

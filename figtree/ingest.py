@@ -15,6 +15,7 @@ Pipeline:
 from __future__ import annotations
 
 import gc
+import hashlib
 import re
 
 import numpy as np
@@ -287,7 +288,6 @@ def ingest_text_to_figments(
     sep_ids = tokenizer.encode("\n\n", add_special_tokens=False)
     stream: list[int] = []
     starts: list[int] = []
-    kept_sentences: list[str] = []
     for sent in kept_sentences:
         ids = tokenizer.encode(sent, add_special_tokens=False)
         if not ids:
@@ -296,7 +296,6 @@ def ingest_text_to_figments(
             stream.extend(sep_ids)
         starts.append(len(stream))
         stream.extend(ids)
-        kept_sentences.append(sent)
 
     if not stream:
         raise ValueError("Text produced zero tokens")
@@ -438,6 +437,12 @@ def ingest_text_to_figments(
         )
         image_text = summary
 
+    # Derive a stable, unique image/article id from source + text so it does not
+    # collide with a paragraph figment that has the same text.
+    image_id = hashlib.sha256(
+        f"{source_id}:{image_text}".encode("utf-8")
+    ).hexdigest()[:16]
+
     image = Figment.create(
         text=image_text,
         boundary=image_boundary,
@@ -447,6 +452,7 @@ def ingest_text_to_figments(
         children=[f.figment_id for f in paragraph_figments],
         trust=trust,
         kind="article",
+        figment_id=image_id,
     )
 
     trust_figment = Figment.create(

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from figtree.figment import Figment
+from figtree.ingest import ingest_text_to_figments, split_into_paragraphs, split_into_sentences
+from figtree.lancedb_store import connect
 from figtree.summarize import summarize_image
 
 
@@ -83,3 +85,13 @@ def test_image_figment_links_children():
     assert image.kind == "article"
     assert image.is_container()
     assert image.children == [c.figment_id for c in children]
+
+
+def test_split_into_paragraphs_and_sentences():
+    text = "First paragraph has at least twenty characters.\n\nSecond paragraph with two sentences. Here is the second."
+    paragraphs = split_into_paragraphs(text)
+    assert len(paragraphs) == 2
+    assert "First paragraph" in paragraphs[0]
+    sentences = split_into_sentences(paragraphs[0])
+    assert len(sentences) == 1
+    assert sentences[0].startswith("First paragraph")
