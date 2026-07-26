@@ -225,6 +225,8 @@ def ingest_text_to_figments(
     kv_manager=None,
     compute_kv: bool = False,
     summarize_images: bool = False,
+    max_tokens: int = 512,
+    use_kv_kernel: bool = False,
 ) -> list[Figment]:
     """Ingest text into atomic figments with boundary + (optional) K/V capture.
 
@@ -236,6 +238,11 @@ def ingest_text_to_figments(
     (lazy mode — recomputed on demand by ``KVCacheManager``). Set
     ``compute_kv=True`` (and pass a ``kv_manager``) to eagerly persist quantized
     K/V blobs and record ``kv_uri`` on each figment.
+
+    Memory-constrained GPUs: ``max_tokens`` truncates the input to the first
+    N tokens before splitting, so the forward pass fits in a small VRAM budget.
+    The custom KV projection kernel is disabled by default for ingestion; pass
+    ``use_kv_kernel=True`` to opt into it.
     """
     if store is None:
         raise ValueError(
@@ -246,6 +253,19 @@ def ingest_text_to_figments(
 
     if crystal_layer is None:
         crystal_layer = detect_crystal_layer(model, tokenizer)
+
+    # Truncate to a token budget so the forward pass fits on tight GPUs.
+    if max_tokens and max_tokens > 0:
+        try:
+            truncated_ids = tokenizer.encode(
+                text,
+                add_special_tokens=False,
+                max_length=max_tokens,
+                truncation=True,
+            )
+            text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
+        except Exception as exc:
+            raise ValueError(f"Tokenization failed: {exc}") from exc
 
     paragraphs = split_into_paragraphs(text, min_chars=min_chars)
     if not paragraphs:
@@ -271,9 +291,9 @@ def ingest_text_to_figments(
     num_kv_heads = config.num_key_value_heads
     head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
     kv_dim = num_kv_heads * head_dim
-    # Try the CUDA kernel for both dense and 4-bit models; _project_kv falls
-    # back to a PyTorch matmul if the kernel cannot be built or dtype is unsupported.
-    use_kernel = True
+    # Use the custom CUDA kernel only when explicitly requested; the PyTorch
+    # matmul fallback is more reliable on tight/fragmented GPUs.
+    use_kernel = use_kv_kernel
 
     def make_hook(layer_idx, storage):
         def hook(mod, inp, out):
@@ -318,6 +338,8 @@ def ingest_text_to_figments(
 
     try:
         with torch.no_grad():
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             emb_out = model.get_input_embeddings()(all_ids)
             model(all_ids)
 
@@ -349,6 +371,8 @@ def ingest_text_to_figments(
                 last_tok = end - 1
                 if si + 1 < len(starts):
                     last_tok -= len(sep_ids)
+                # Guard against any tokenization/forward length mismatch.
+                last_tok = max(0, min(last_tok, seq_len_total - 1))
                 sentence_last_tok.append(last_tok)
                 sentence_figment_paragraph_idx.append(sentence_to_paragraph[si])
                 # boundaries: hidden state of the last real token, per layer.
