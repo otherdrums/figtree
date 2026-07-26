@@ -85,12 +85,15 @@ def test_figment_dict_roundtrip():
     f.children = ["c1", "c2"]
     f.sources = ["p1"]
     f.trust = 0.83
+    f.kind = "article"
     d = f.to_dict()
     assert isinstance(d["boundary"], list)
+    assert d["kind"] == "article"
     f2 = Figment.from_dict(d)
     assert f2.figment_id == f.figment_id
     assert f2.text == f.text
     assert f2.children == ["c1", "c2"]
     assert f2.sources == ["p1"]
     assert f2.trust == 0.83
+    assert f2.kind == "article"
     assert np.allclose(f2.boundary, f.boundary)

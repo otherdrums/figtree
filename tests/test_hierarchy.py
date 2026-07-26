@@ -77,6 +77,9 @@ def test_image_figment_links_children():
         meta={"is_image": True, "source_id": "s"},
         children=[c.figment_id for c in children],
         trust=0.5,
+        kind="article",
     )
     assert image.is_image()
+    assert image.kind == "article"
+    assert image.is_container()
     assert image.children == [c.figment_id for c in children]

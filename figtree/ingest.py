@@ -1,14 +1,15 @@
 """Ingestion pipeline: text → atomic figments with boundary + kv_cache capture.
 
 Pipeline:
-1. Split text into sentences
-2. For each sentence:
-   a. Forward through model layers 0..crystal_layer
-   b. Capture boundary = hidden state of LAST token at crystal_layer
-   c. Compute per-token per-layer K/V (unrotated)
-   d. Create Figment
-3. Create Image Figment with children = sentence figments
-4. Optionally create TrustFigment
+1. Split text into paragraphs
+2. Split each paragraph into sentences
+3. Build one token stream with separators between sentences
+4. Forward through the model once over the whole stream
+5. Slice hidden states per sentence and per paragraph
+6. Create sentence figments (children of paragraphs)
+7. Create paragraph figments (children of the image)
+8. Create Image (article) Figment with children = paragraph figments
+9. Optionally create TrustFigment
 """
 
 from __future__ import annotations
@@ -82,6 +83,34 @@ def split_into_sentences(text: str, min_chars: int = 20) -> list[str]:
     if buf:
         if merged:
             merged[-1] += " " + buf
+        else:
+            merged.append(buf)
+    return merged
+
+
+def split_into_paragraphs(text: str, min_chars: int = 20) -> list[str]:
+    """Split text into paragraphs, dropping empty runs.
+
+    Paragraphs are split on blank lines. Very short paragraphs are merged
+    with the previous one so that a single stray sentence does not create its
+    own paragraph.
+    """
+    raw = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
+    merged = []
+    buf = ""
+    for p in raw:
+        if len(p) < min_chars and not buf:
+            buf = p
+        elif buf:
+            buf += "\n\n" + p
+            if len(buf) >= min_chars:
+                merged.append(buf)
+                buf = ""
+        else:
+            merged.append(p)
+    if buf:
+        if merged:
+            merged[-1] += "\n\n" + buf
         else:
             merged.append(buf)
     return merged
@@ -217,11 +246,25 @@ def ingest_text_to_figments(
     if crystal_layer is None:
         crystal_layer = detect_crystal_layer(model, tokenizer)
 
-    sentences = split_into_sentences(text, min_chars=min_chars)
-    if not sentences:
+    paragraphs = split_into_paragraphs(text, min_chars=min_chars)
+    if not paragraphs:
+        raise ValueError("Text produced zero paragraphs")
+
+    # Flatten paragraphs into sentences while remembering which paragraph each
+    # sentence belongs to, so we can build paragraph figments later.
+    kept_sentences: list[str] = []
+    sentence_to_paragraph: list[int] = []
+    for pi, paragraph in enumerate(paragraphs):
+        sents = split_into_sentences(paragraph, min_chars=min_chars)
+        kept_sentences.extend(sents)
+        sentence_to_paragraph.extend([pi] * len(sents))
+
+    if not kept_sentences:
         raise ValueError("Text produced zero sentences")
 
     sentence_figments: list[Figment] = []
+    sentence_last_tok: list[int] = []
+    sentence_figment_paragraph_idx: list[int] = []
     num_layers = len(model.model.layers)
     config = model.config
     num_kv_heads = config.num_key_value_heads
@@ -245,7 +288,7 @@ def ingest_text_to_figments(
     stream: list[int] = []
     starts: list[int] = []
     kept_sentences: list[str] = []
-    for sent in sentences:
+    for sent in kept_sentences:
         ids = tokenizer.encode(sent, add_special_tokens=False)
         if not ids:
             continue
@@ -307,6 +350,8 @@ def ingest_text_to_figments(
                 last_tok = end - 1
                 if si + 1 < len(starts):
                     last_tok -= len(sep_ids)
+                sentence_last_tok.append(last_tok)
+                sentence_figment_paragraph_idx.append(sentence_to_paragraph[si])
                 # boundaries: hidden state of the last real token, per layer.
                 boundaries_list = [
                     layer_outputs[li][0, last_tok, :].float().cpu() for li in range(num_layers)
@@ -322,6 +367,7 @@ def ingest_text_to_figments(
                     boundary_emb=boundary_emb,
                     meta={"source_id": source_id, "crystal_layer": crystal_layer},
                     trust=trust,
+                    kind="sentence",
                 )
                 sentence_figments.append(figment)
 
@@ -350,15 +396,45 @@ def ingest_text_to_figments(
         for h in handles:
             h.remove()
 
-    image_boundary = sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1)
-    image_boundaries = sentence_figments[0].boundaries.copy() if sentence_figments else None
-    image_emb = sentence_figments[0].boundary_emb.copy() if sentence_figments else None
+    # Build paragraph figments: group sentences by paragraph and use the boundary
+    # of the paragraph's last sentence as the paragraph boundary.
+    paragraph_figments: list[Figment] = []
+    paragraph_to_sentences: list[list[str]] = [[] for _ in paragraphs]
+    for sent_fig, pi in zip(sentence_figments, sentence_figment_paragraph_idx):
+        paragraph_to_sentences[pi].append(sent_fig.figment_id)
+
+    for pi, sent_ids in enumerate(paragraph_to_sentences):
+        if not sent_ids:
+            continue
+        last_sent = sentence_figments[sentence_figment_paragraph_idx.index(pi)]
+        paragraph_figments.append(
+            Figment.create(
+                text=paragraphs[pi],
+                boundary=last_sent.boundary.copy(),
+                boundaries=last_sent.boundaries.copy() if last_sent.boundaries is not None else None,
+                boundary_emb=last_sent.boundary_emb.copy() if last_sent.boundary_emb is not None else None,
+                meta={"source_id": source_id, "crystal_layer": crystal_layer},
+                children=sent_ids,
+                trust=trust,
+                kind="paragraph",
+            )
+        )
+
+    image_boundary = paragraph_figments[0].boundary.copy() if paragraph_figments else (
+        sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1)
+    )
+    image_boundaries = paragraph_figments[0].boundaries.copy() if paragraph_figments else (
+        sentence_figments[0].boundaries.copy() if sentence_figments else None
+    )
+    image_emb = paragraph_figments[0].boundary_emb.copy() if paragraph_figments else (
+        sentence_figments[0].boundary_emb.copy() if sentence_figments else None
+    )
     image_text = text
-    if summarize_images and sentence_figments:
+    if summarize_images and paragraph_figments:
         from figtree.summarize import summarize_image
 
         summary, image_boundary, image_boundaries, image_emb = summarize_image(
-            model, tokenizer, sentence_figments, crystal_layer=crystal_layer
+            model, tokenizer, paragraph_figments, crystal_layer=crystal_layer
         )
         image_text = summary
 
@@ -368,18 +444,22 @@ def ingest_text_to_figments(
         boundaries=image_boundaries,
         boundary_emb=image_emb,
         meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True, "base_trust": trust},
-        children=[f.figment_id for f in sentence_figments],
+        children=[f.figment_id for f in paragraph_figments],
         trust=trust,
+        kind="article",
     )
 
     trust_figment = Figment.create(
         text=f"Source {source_id} has trust {trust:.2f}",
-        boundary=sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1),
+        boundary=paragraph_figments[0].boundary.copy() if paragraph_figments else (
+            sentence_figments[0].boundary.copy() if sentence_figments else np.zeros(1)
+        ),
         meta={"edge_type": "trust", "about_figment": image.figment_id, "score": trust, "base_trust": trust},
         sources=[image.figment_id],
+        kind="trust",
     )
 
-    all_figments = [image] + sentence_figments + [trust_figment]
+    all_figments = [image] + paragraph_figments + sentence_figments + [trust_figment]
 
     hidden = image.boundary.shape[0]
     # Upsert in deterministic id order so trust/image overwrite cleanly.

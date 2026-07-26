@@ -61,24 +61,23 @@ def main():
     print(f"Created {len(figments)} figments in {STORE_URI}")
     assert store.count() == len(figments), "LanceDB row count mismatch"
 
-    # Reload atomic figments from the store (round-trip + compression).
-    atomic_figments = [f for f in store.by_source("test_source")
-                       if not f.is_image() and not f.is_trust_assertion()]
-    assert atomic_figments, "No atomic figments loaded from store"
+    # Reload sentence-level figments from the store (round-trip + compression).
+    sentence_figments = [f for f in store.by_source("test_source")
+                          if f.kind == "sentence"]
+    assert sentence_figments, "No sentence figments loaded from store"
     # Compression sanity: boundary vectors round-trip exactly (order-independent).
-    orig_map = {f.figment_id: f for f in figments
-                if not f.is_image() and not f.is_trust_assertion()}
-    assert set(orig_map) == {f.figment_id for f in atomic_figments}, \
+    orig_map = {f.figment_id: f for f in figments if f.kind == "sentence"}
+    assert set(orig_map) == {f.figment_id for f in sentence_figments}, \
         "Figment id set mismatch after store round-trip"
     for fid, loaded in zip(orig_map, atomic_figments):
         assert orig_map[fid].boundary.shape == loaded.boundary.shape
         assert orig_map[fid].boundary.dtype == loaded.boundary.dtype
 
     # Generate (text path)
-    print(f"\nGenerating with {len(atomic_figments)} figments...")
+    print(f"\nGenerating with {len(sentence_figments)} figments...")
     gen = FigmentGenerator(model, tokenizer)
     result = gen.generate(
-        figments=atomic_figments,
+        figments=sentence_figments,
         prompt="What happened at Davos?",
         max_new_tokens=200,
     )
@@ -87,7 +86,7 @@ def main():
     # Boundary-based generation: lazy recompute via kv_manager (no eager blob).
     print("\nGenerating from boundaries (lazy K/V recompute)...")
     result_bd = gen.generate_from_boundaries(
-        figments=atomic_figments,
+        figments=sentence_figments,
         prompt="What happened at Davos?",
         max_new_tokens=200,
         kv_manager=kv_manager,
@@ -114,9 +113,9 @@ def main():
     # enumeration prompt (E1+E2) must reproduce every checkable atom (130, 2,700)
     # in a single pass. The verify-and-patch loop was removed once the faithful
     # path proved flawless on its own, so recall must already be 1.0 with no patch.
-    all_atomic = [f for f in atomic_figments if not f.is_image() and not f.is_trust_assertion()]
+    all_sentences = [f for f in sentence_figments if f.kind == "sentence"]
     recall_res = gen.generate_faithful(
-        figments=all_atomic,
+        figments=all_sentences,
         prompt=(
             "List EVERY figure from the source verbatim as a bullet list: each "
             "number, percent, year, and named entity. Do not summarize. Include "
@@ -143,7 +142,7 @@ def main():
             )
         long_source = "\n".join(long_lines)
         enum_res = gen.generate_enumerated(
-            figments=all_atomic,
+            figments=sentence_figments,
             prompt=(
                 "List EVERY figure from the source verbatim as a bullet list: each "
                 "number, percent, year, and named entity. Do not summarize."

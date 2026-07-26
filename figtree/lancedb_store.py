@@ -75,6 +75,7 @@ def _schema_for(hidden_size: int) -> type[LanceModel]:
         source_id: str = ""
         edge_type: str | None = None
         trust: float = 0.5
+        kind: str = "atomic"
         is_image: bool = False
         has_kv_cache: bool = False
         kv_uri: str | None = None
@@ -175,6 +176,7 @@ class FigmentStore:
             "source_id": f.meta.get("source_id", ""),
             "edge_type": f.meta.get("edge_type"),
             "trust": float(f.trust),
+            "kind": f.kind,
             "is_image": f.is_image(),
             "has_kv_cache": False,
             "kv_uri": None,
@@ -210,6 +212,17 @@ class FigmentStore:
         if rec.get("kv_uri"):
             meta["kv_uri"] = rec["kv_uri"]
             meta["has_kv_cache"] = bool(rec.get("has_kv_cache", False))
+        kind = rec.get("kind", "")
+        children = list(rec.get("children") or [])
+        if not kind:
+            if meta.get("edge_type") == "trust":
+                kind = "trust"
+            elif meta.get("edge_type"):
+                kind = "edge"
+            elif meta.get("is_image") or len(children) > 0:
+                kind = "image"
+            else:
+                kind = "atomic"
         return Figment(
             figment_id=rec["figment_id"],
             text=rec["text"],
@@ -217,9 +230,10 @@ class FigmentStore:
             boundaries=boundaries_arr,
             boundary_emb=emb_arr,
             meta=meta,
-            children=list(rec.get("children") or []),
+            children=children,
             sources=list(rec.get("sources") or []),
             trust=float(rec.get("trust", 0.5)),
+            kind=kind,
         )
 
     # -- CRUD ------------------------------------------------------------ #
@@ -277,8 +291,8 @@ class FigmentStore:
             return []
         tbl = self.table
         return [self._from_record(r) for r in tbl.search().select(
-            ["figment_id", "text", "source_id", "edge_type", "trust", "is_image",
-             "has_kv_cache", "kv_uri", "children", "sources", "meta_json",
+            ["figment_id", "text", "source_id", "edge_type", "trust", "kind",
+             "is_image", "has_kv_cache", "kv_uri", "children", "sources", "meta_json",
              "boundary", "boundaries", "boundary_emb"]
         ).to_list()]
 

@@ -1,11 +1,13 @@
 """Figment — the universal unit of knowledge in Figtree.
 
-Everything is a Figment:
-- A sentence from a news article
-- An Image (Figment with children=[...])
-- An edge (Figment with meta["edge_type"] = "supports")
-- A trust assertion (Figment with meta["edge_type"] = "trust")
-- Even the system itself (meta-figments about Figtree)
+Everything is a Figment. Each figment carries a free-form ``kind`` that lets
+applications build their own hierarchies (article, paragraph, sentence, role,
+edge, trust, etc.). A few kinds are conventional:
+
+- ``atomic`` — default leaf figment
+- ``image`` / ``article`` — container figments
+- ``edge`` — relationship figments
+- ``trust`` — trust assertion figments
 
 Figments are persisted as rows in a LanceDB table (see ``figtree/lancedb_store.py``);
 K/V caches live outside the row as external quantized blobs managed by
@@ -20,18 +22,36 @@ from typing import Any
 
 import numpy as np
 
+# Conventional built-in kinds. Applications are free to invent more.
+KIND_ATOMIC = "atomic"
+KIND_IMAGE = "image"
+KIND_ARTICLE = "article"
+KIND_PARAGRAPH = "paragraph"
+KIND_SENTENCE = "sentence"
+KIND_ROLE = "role"
+KIND_EDGE = "edge"
+KIND_TRUST = "trust"
+KIND_CONTAINER = "container"
+
+CONTAINER_KINDS = {
+    KIND_IMAGE, KIND_ARTICLE, KIND_PARAGRAPH, KIND_SENTENCE, KIND_CONTAINER,
+}
+
 
 @dataclass
 class Figment:
-    """A single atomic unit of knowledge."""
+    """A single unit of knowledge. Kinds are application-defined; the library
+    only treats ``kind`` as a filterable label, plus a few conventional helpers.
+    """
 
     figment_id: str             # SHA-256(text)[:16]
     text: str                   # Natural language statement
     boundary: np.ndarray        # (hidden_size,) float32 — crystal layer
     meta: dict[str, Any]        # edge_type, about_figment, etc.
-    children: list[str]         # Child figment IDs (Images = figments with children)
+    children: list[str]         # Child figment IDs
     sources: list[str]          # Parent figment IDs
     trust: float                # Cached trust score
+    kind: str = KIND_ATOMIC     # Free-form type label
     boundaries: np.ndarray | None = None  # (num_layers, hidden_size) float32 — all layers
     boundary_emb: np.ndarray | None = None  # (hidden_size,) float32 — last-token embedding
 
@@ -48,6 +68,7 @@ class Figment:
         children: list[str] | None = None,
         sources: list[str] | None = None,
         trust: float = 0.5,
+        kind: str | None = None,
         boundaries: np.ndarray | None = None,
         boundary_emb: np.ndarray | None = None,
         figment_id: str | None = None,
@@ -58,6 +79,18 @@ class Figment:
         (e.g. one canonical trust Figment per source that can be overwritten).
         """
         figment_id = figment_id or hashlib.sha256(text.encode()).hexdigest()[:16]
+        # Backward compatibility: legacy images set ``is_image`` in meta.
+        if kind is None:
+            meta = meta or {}
+            if meta.get("edge_type"):
+                if meta.get("edge_type") == "trust":
+                    kind = KIND_TRUST
+                else:
+                    kind = KIND_EDGE
+            elif meta.get("is_image") or len(children or []) > 0:
+                kind = KIND_IMAGE
+            else:
+                kind = KIND_ATOMIC
         return cls(
             figment_id=figment_id,
             text=text,
@@ -68,19 +101,31 @@ class Figment:
             children=children or [],
             sources=sources or [],
             trust=trust,
+            kind=kind,
         )
 
+    def is_container(self) -> bool:
+        """True if this figment has children or a container-like kind."""
+        return self.kind in CONTAINER_KINDS or len(self.children) > 0
+
     def is_image(self) -> bool:
-        """True if this figment contains other figments (i.e., has children)."""
-        return len(self.children) > 0
+        """Legacy helper: True if this figment is an image/article container.
+
+        Historically this was any figment with children. With ``kind`` it is now
+        explicit: article, paragraph, image, etc. are containers, but a generic
+        edge with children is not an image.
+        """
+        return self.kind in {KIND_IMAGE, KIND_ARTICLE, KIND_PARAGRAPH, KIND_CONTAINER} or (
+            self.meta.get("is_image") is True
+        )
 
     def is_edge(self) -> bool:
         """True if this figment represents a graph edge."""
-        return self.meta.get("edge_type") is not None
+        return self.kind == KIND_EDGE or self.meta.get("edge_type") is not None
 
     def is_trust_assertion(self) -> bool:
         """True if this figment represents a trust score."""
-        return self.meta.get("edge_type") == "trust"
+        return self.kind == KIND_TRUST or self.meta.get("edge_type") == "trust"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain, JSON-friendly dict (independent of the store).
@@ -101,6 +146,7 @@ class Figment:
             "children": list(self.children),
             "sources": list(self.sources),
             "trust": float(self.trust),
+            "kind": self.kind,
         }
 
     @classmethod
@@ -109,6 +155,19 @@ class Figment:
         boundary = np.asarray(d["boundary"], dtype=np.float32)
         boundaries = d.get("boundaries")
         boundary_emb = d.get("boundary_emb")
+        meta = dict(d.get("meta", {}))
+        children = list(d.get("children", []))
+        kind = d.get("kind", "")
+        if not kind:
+            # Backward compatibility: infer kind from old metadata.
+            if meta.get("edge_type") == "trust":
+                kind = KIND_TRUST
+            elif meta.get("edge_type"):
+                kind = KIND_EDGE
+            elif meta.get("is_image") or len(children) > 0:
+                kind = KIND_IMAGE
+            else:
+                kind = KIND_ATOMIC
         return cls(
             figment_id=d["figment_id"],
             text=d["text"],
@@ -119,12 +178,12 @@ class Figment:
             boundary_emb=(
                 np.asarray(boundary_emb, dtype=np.float32) if boundary_emb is not None else None
             ),
-            meta=dict(d.get("meta", {})),
-            children=list(d.get("children", [])),
+            meta=meta,
+            children=children,
             sources=list(d.get("sources", [])),
             trust=float(d.get("trust", 0.5)),
+            kind=kind,
         )
 
     def __repr__(self) -> str:
-        kind = "image" if self.is_image() else "edge" if self.is_edge() else "atomic"
-        return f"Figment({kind}, id={self.figment_id[:8]}..., trust={self.trust:.2f}, text={self.text[:40]!r})"
+        return f"Figment({self.kind}, id={self.figment_id[:8]}..., trust={self.trust:.2f}, text={self.text[:40]!r})"

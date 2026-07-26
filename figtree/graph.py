@@ -195,6 +195,7 @@ class Figtree:
                         meta={"edge_type": "supports", "dedup": "exact"},
                         sources=[canonical],
                         children=[duplicate],
+                        kind="edge",
                     )
                     edges.append(edge)
                     continue
@@ -211,6 +212,7 @@ class Figtree:
                             meta={"edge_type": "supports", "dedup": "semantic", "similarity": float(sim)},
                             sources=[canonical],
                             children=[duplicate],
+                            kind="edge",
                         )
                         edges.append(edge)
         return edges
@@ -236,6 +238,7 @@ class Figtree:
                         meta={"edge_type": "same_entity", "entities": list(shared)},
                         sources=[fid_list[i]],
                         children=[fid_list[j]],
+                        kind="edge",
                     )
                     edges.append(edge)
         return edges
@@ -274,6 +277,7 @@ class Figtree:
                 },
                 figment_id=fid,
                 trust=info["adjusted_trust"],
+                kind="trust",
             )
             for f in self.by_source.get(src, []):
                 self.figments[f].trust = info["adjusted_trust"]
