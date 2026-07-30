@@ -251,7 +251,17 @@ class FigmentStore:
         hs = hidden_size or self._hidden_size or figments[0].hidden_size
         self._ensure_table(hs)
 
-        records: list[dict] = [self._to_record(f, hs) for f in figments]
+        # Deduplicate by figment_id (last wins) — merge_insert requires each
+        # target row be matched by at most one source row.
+        records: list[dict] = []
+        seen: set[str] = set()
+        for f in reversed(figments):
+            fid = f.figment_id
+            if fid in seen:
+                continue
+            seen.add(fid)
+            records.append(self._to_record(f, hs))
+        records.reverse()
         if records:
             (
                 self._table.merge_insert("figment_id")
