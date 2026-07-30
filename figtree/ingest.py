@@ -17,6 +17,8 @@ from __future__ import annotations
 import gc
 import hashlib
 import re
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -227,6 +229,13 @@ def ingest_text_to_figments(
     summarize_images: bool = False,
     max_tokens: int = 512,
     use_kv_kernel: bool = False,
+    *, 
+    decode_prompt: str | None = None,
+    decode_max_tokens: int = 0,
+    decode_temperature: float = 0.0,
+    decode_prompt_fn: (
+        Callable[[list[str], list[str], list[int]], str | None] | None
+    ) = None,
 ) -> list[Figment]:
     """Ingest text into atomic figments with boundary + (optional) K/V capture.
 
@@ -243,6 +252,14 @@ def ingest_text_to_figments(
     N tokens before splitting, so the forward pass fits in a small VRAM budget.
     The custom KV projection kernel is disabled by default for ingestion; pass
     ``use_kv_kernel=True`` to opt into it.
+
+    Single-pass decode: when ``decode_prompt`` (or ``decode_prompt_fn``) is
+    provided, the prompt is prefilled and decoded from the SAME forward-pass
+    cache, producing a ``decode_output`` stored in the image figment's meta.
+    ``decode_prompt_fn`` receives (paragraphs, kept_sentences,
+    sentence_to_paragraph) after the internal split and should return a prompt
+    string or None to skip.  This is used for role extraction at ingest time,
+    eliminating a separate decompose pass.
     """
     if store is None:
         raise ValueError(
@@ -341,7 +358,8 @@ def ingest_text_to_figments(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             emb_out = model.get_input_embeddings()(all_ids)
-            model(all_ids)
+            outputs = model(all_ids, use_cache=True)
+            pkv = outputs.past_key_values
 
             if len(layer_outputs) != num_layers:
                 raise RuntimeError(f"Expected {num_layers} layer outputs, got {len(layer_outputs)}")
@@ -383,6 +401,7 @@ def ingest_text_to_figments(
                 boundary_crystal = boundaries_arr[crystal_layer]
                 boundary_emb = emb_out[0, last_tok, :].float().cpu().numpy()
 
+                sent_id = hashlib.sha256(f"sentence:{sent}".encode()).hexdigest()[:16]
                 figment = Figment.create(
                     text=sent,
                     boundary=boundary_crystal,
@@ -391,6 +410,7 @@ def ingest_text_to_figments(
                     meta={"source_id": source_id, "crystal_layer": crystal_layer},
                     trust=trust,
                     kind="sentence",
+                    figment_id=sent_id,
                 )
                 sentence_figments.append(figment)
 
@@ -419,6 +439,63 @@ def ingest_text_to_figments(
         for h in handles:
             h.remove()
 
+    # ── Single-pass decode ────────────────────────────────────────────────
+    # Reuse the forward-pass cache to prefill + decode a prompt, avoiding a
+    # separate forward pass for role extraction or other side tasks.
+    # Priority: decode_prompt_fn > decode_prompt > skip
+    if decode_prompt_fn is not None:
+        try:
+            effective_prompt = decode_prompt_fn(paragraphs, kept_sentences, sentence_to_paragraph)
+        except Exception as exc:
+            print(f"[ingest] decode_prompt_fn failed: {exc}")
+            effective_prompt = None
+    else:
+        effective_prompt = decode_prompt
+
+    decode_output: str | None = None
+    if effective_prompt and decode_max_tokens > 0 and pkv is not None:
+        try:
+            from figtree.kernel.prompt import build_prompt_ids
+            prompt_ids = build_prompt_ids(tokenizer, effective_prompt, enable_thinking=False)
+            if prompt_ids:
+                prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+                with torch.no_grad():
+                    out = model(prompt_tensor, past_key_values=pkv, use_cache=True)
+                    pkv = out.past_key_values
+                    logits = out.logits
+
+                gen_ids = list(prompt_ids)
+                eos_id = tokenizer.eos_token_id
+
+                for step in range(decode_max_tokens):
+                    if decode_temperature == 0.0:
+                        nxt = int(logits[0, -1, :].argmax(dim=-1).item())
+                    else:
+                        probs = torch.softmax(
+                            logits[0, -1, :] / max(decode_temperature, 1e-8), dim=-1
+                        )
+                        nxt = int(torch.multinomial(probs, 1).item())
+
+                    if nxt == eos_id:
+                        break
+                    gen_ids.append(nxt)
+
+                    next_tensor = torch.tensor([[nxt]], dtype=torch.long, device=device)
+                    with torch.no_grad():
+                        out = model(next_tensor, past_key_values=pkv, use_cache=True)
+                        pkv = out.past_key_values
+                        logits = out.logits
+
+                decode_output = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+                del pkv
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+        except Exception as exc:
+            print(f"[ingest] Decode failed: {exc}")
+
     # Build paragraph figments: group sentences by paragraph and use the boundary
     # of the paragraph's last sentence as the paragraph boundary.
     paragraph_figments: list[Figment] = []
@@ -430,6 +507,7 @@ def ingest_text_to_figments(
         if not sent_ids:
             continue
         last_sent = sentence_figments[sentence_figment_paragraph_idx.index(pi)]
+        para_id = hashlib.sha256(f"paragraph:{paragraphs[pi]}".encode()).hexdigest()[:16]
         paragraph_figments.append(
             Figment.create(
                 text=paragraphs[pi],
@@ -440,6 +518,7 @@ def ingest_text_to_figments(
                 children=sent_ids,
                 trust=trust,
                 kind="paragraph",
+                figment_id=para_id,
             )
         )
 
@@ -472,7 +551,7 @@ def ingest_text_to_figments(
         boundary=image_boundary,
         boundaries=image_boundaries,
         boundary_emb=image_emb,
-        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True, "base_trust": trust},
+        meta={"source_id": source_id, "crystal_layer": crystal_layer, "is_image": True, "base_trust": trust, **({"decode_output": decode_output} if decode_output else {})},
         children=[f.figment_id for f in paragraph_figments],
         trust=trust,
         kind="article",
