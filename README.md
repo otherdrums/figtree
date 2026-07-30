@@ -149,7 +149,7 @@ Key public symbols (see `figtree/__init__.py`):
 |--------|---------|
 | `Figment` | The universal primitive (text + boundary + meta). `to_dict()`/`from_dict()` for serialization. |
 | `connect(uri)` / `FigmentStore` | Open a LanceDB-backed store; `upsert`, `get`, `all`, `by_source`, `search` (ANN by boundary), `count`. |
-| `ingest_text_to_figments` | Text → atomic figments with boundaries + optional K/V capture. |
+| `ingest_text_to_figments` | Text → atomic figments with boundaries + optional K/V capture + optional **single-pass decode** from the forward-pass cache (`decode_prompt`/`decode_prompt_fn`). |
 | `FigmentGenerator` | `generate` (text), `generate_faithful` (greedy, recall-by-construction), `generate_enumerated` (long sources), `generate_from_boundaries` (cached K/V). |
 | `Figtree` | Graph ops: `deduplicate`, `create_edges`, `analyze_sources`, `propagate_trust` (idempotent, store-persistent), `build_trust_aware_context`. |
 | `KVCacheManager` | External quantized K/V blobs (lazy/eager, local or `s3://`). |
@@ -227,8 +227,18 @@ Text is split into sentences. For each sentence:
 3. For each layer, capture input hidden state, apply `input_layernorm`,
    project through `k_proj`/`v_proj` with `k_norm`, store unrotated K/V
 4. Upsert into the LanceDB store (`lancedb_store.connect(uri)`) with
-   compression. K/V is external: lazy by default, or persisted as a quantized
-   blob via `KVCacheManager` when `compute_kv=True`.
+    compression. K/V is external: lazy by default, or persisted as a quantized
+    blob via `KVCacheManager` when `compute_kv=True`.
+
+**Single-pass decode** (optional): When `decode_prompt` or `decode_prompt_fn` is
+provided, the forward pass uses `use_cache=True` and captures `past_key_values`.
+After boundary extraction, the prompt is pre-filled into the same cache and
+autoregressively decoded (greedy or temperature-based). This avoids a separate
+forward pass for tasks like role extraction — the model already has the article
+context from the cached K/V. The prompt is wrapped in the Qwen3 chat template
+with `enable_thinking=False` (see `figtree/kernel/prompt.py:build_prompt_ids`)
+to suppress chain-of-thought reasoning. The decoded text is stored in the image
+figment's `meta["decode_output"]`.
 
 ### 2. Generation (`figtree/generate.py`)
 

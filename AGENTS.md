@@ -109,7 +109,14 @@ figments = ingest_text_to_figments(
     trust=0.95,
 )
 # Returns: [image, atomic_1, atomic_2, ..., trust_assertion]
-```
+
+Additional keyword-only parameters enable **single-pass decode**: pass
+``decode_prompt`` (or ``decode_prompt_fn`` callback) along with
+``decode_max_tokens`` and ``decode_temperature``. The forward pass captures
+``past_key_values`` (``use_cache=True``), and after boundary extraction the
+prompt is decoded from the same cache, storing output in
+``figments[0].meta["decode_output"]``. Uses ``build_prompt_ids`` with
+``enable_thinking=False`` to suppress chain-of-thought.
 
 For each sentence:
 1. Forward through model layers 0..crystal_layer
