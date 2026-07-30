@@ -85,8 +85,10 @@ def _schema_for(hidden_size: int) -> type[LanceModel]:
         # dict on read (see _from_record).
         meta_json: str = "{}"
         boundary: Vector(hidden_size)
-        # Flattened (num_layers * hidden_size,) for reconstruction; nullable.
-        boundaries: list[float] | None = None
+        # The per-layer boundaries column was removed — it was 92,160 floats/row
+        # and only used by FigtreeGraph.deduplicate() which is O(n²).  If you
+        # need it back, add ``boundaries: list[float] | None = None``.
+        # boundary_emb (2,560 floats) is kept; it's tiny and used by context.py.
         boundary_emb: list[float] | None = None
 
     return FigmentRecord
@@ -184,10 +186,6 @@ class FigmentStore:
             "sources": list(f.sources),
             "meta_json": json.dumps(dict(f.meta), default=str),
             "boundary": b.tolist(),
-            "boundaries": (
-                f.boundaries.astype(np.float32).ravel().tolist()
-                if f.boundaries is not None else None
-            ),
             "boundary_emb": (
                 f.boundary_emb.astype(np.float32).tolist()
                 if f.boundary_emb is not None else None
@@ -201,12 +199,9 @@ class FigmentStore:
     @classmethod
     def _from_record(cls, rec: dict[str, Any]) -> Figment:
         boundary = np.asarray(rec["boundary"], dtype=np.float32)
-        boundaries = rec.get("boundaries")
+        # The per-layer boundaries column was removed from the schema in v0.2.2.
+        # If loading a legacy row the column may still exist — discard it.
         boundary_emb = rec.get("boundary_emb")
-        boundaries_arr = (
-            np.asarray(boundaries, dtype=np.float32).reshape(-1, boundary.shape[0])
-            if boundaries is not None else None
-        )
         emb_arr = np.asarray(boundary_emb, dtype=np.float32) if boundary_emb is not None else None
         meta = json.loads(rec.get("meta_json") or "{}")
         if rec.get("kv_uri"):
@@ -227,7 +222,6 @@ class FigmentStore:
             figment_id=rec["figment_id"],
             text=rec["text"],
             boundary=boundary,
-            boundaries=boundaries_arr,
             boundary_emb=emb_arr,
             meta=meta,
             children=children,
@@ -240,8 +234,10 @@ class FigmentStore:
     def upsert(self, figments: list[Figment], hidden_size: int | None = None) -> None:
         """Insert or overwrite figments in the store.
 
-        An existing ``figment_id`` is overwritten (delete + re-add) so the
-        operation is idempotent. ``hidden_size`` is inferred when omitted.
+        Uses LanceDB's native ``merge_insert`` on the ``figment_id`` primary key
+        so inserts/updates are O(log n) index lookups instead of an O(table) full
+        scan.  The operation is idempotent: an existing ``figment_id`` is updated
+        in place; a new one is inserted.  ``hidden_size`` is inferred when omitted.
         """
         if not figments:
             return
@@ -254,16 +250,15 @@ class FigmentStore:
             self._hidden_size = vec_field.type.list_size
         hs = hidden_size or self._hidden_size or figments[0].hidden_size
         self._ensure_table(hs)
-        existing_ids = {r["figment_id"] for r in self.table.search().select(["figment_id"]).to_list()}
-        for f in figments:
-            rec = self._to_record(f, hs)
-            fid = rec["figment_id"]
-            if fid in existing_ids:
-                # Idempotent overwrite: delete the old row, then append the new
-                # one. (merge_insert/update mishandle the vector column in this
-                # LanceDB version, so delete+add is the reliable path.)
-                self._table.delete(f"figment_id = '{fid}'")
-            self._table.add([rec], mode="append")
+
+        records: list[dict] = [self._to_record(f, hs) for f in figments]
+        if records:
+            (
+                self._table.merge_insert("figment_id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(records)
+            )
 
     def upsert_one(self, f: Figment, hidden_size: int | None = None) -> None:
         """Convenience wrapper to upsert a single figment."""
@@ -285,16 +280,23 @@ class FigmentStore:
             return
         self.table.delete(f"figment_id = '{figment_id}'")
 
-    def all(self) -> list[Figment]:
-        """Return every figment currently stored (empty list if none)."""
+    def all(self, include_boundaries: bool = False) -> list[Figment]:
+        """Return every figment currently stored (empty list if none).
+
+        By default excludes the expensive ``boundaries`` per-layer column
+        (92,160 floats/row), which was removed from the schema. Pass
+        ``include_boundaries=True`` only when the per-layer hidden states
+        are needed (e.g. legacy migration).
+        """
         if not self._has_table():
             return []
         tbl = self.table
-        return [self._from_record(r) for r in tbl.search().select(
-            ["figment_id", "text", "source_id", "edge_type", "trust", "kind",
-             "is_image", "has_kv_cache", "kv_uri", "children", "sources", "meta_json",
-             "boundary", "boundaries", "boundary_emb"]
-        ).to_list()]
+        cols = [
+            "figment_id", "text", "source_id", "edge_type", "trust", "kind",
+            "is_image", "has_kv_cache", "kv_uri", "children", "sources", "meta_json",
+            "boundary", "boundary_emb",
+        ]
+        return [self._from_record(r) for r in tbl.search().select(cols).to_list()]
 
     def by_source(self, source_id: str) -> list[Figment]:
         """Return all figments whose ``source_id`` matches (empty if none)."""
