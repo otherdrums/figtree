@@ -16,3 +16,4 @@ deltas/
 davos_run_*.log
 davos_graph_*.log
 davos_figments_v2/
+.opencode/
