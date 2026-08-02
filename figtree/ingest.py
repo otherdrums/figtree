@@ -18,7 +18,6 @@ import gc
 import hashlib
 import re
 from collections.abc import Callable
-from typing import Any
 
 import numpy as np
 import torch

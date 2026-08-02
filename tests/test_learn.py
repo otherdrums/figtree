@@ -289,7 +289,8 @@ def test_learned_facts_lists_active_only(store):
     assert learned_facts(store, session_id="other") == []
 
 
-def test_news_domain_figments_ignored(store):
+def test_news_domain_figments_visible_to_role_lookup(store):
+    """Role lookup is role-scoped, not domain-scoped (v0.4 generalization)."""
     sid = _mk_statement(store, "Davos summit concluded.", seed=1)
     news_role = Figment.create(
         "Donald Trump", np.zeros(HIDDEN, dtype=np.float32),
@@ -297,7 +298,10 @@ def test_news_domain_figments_ignored(store):
         figment_id=role_figment_id("who", "Donald Trump"),
     )
     store.upsert([news_role], hidden_size=HIDDEN)
-    assert role_lookup(store, "who") == []  # not a learned figment
+    # News-domain role figments are matchable now.
+    hits = role_lookup(store, "who", "Donald Trump")
+    assert [f.figment_id for f, _ in hits] == [news_role.figment_id]
+    # Learn-domain roles are unaffected.
     apply_roles_to_store(sid, "Davos summit concluded.", [("ACTOR", "user"), ("FACT", "Davos summit concluded")], store, learned_at=L0)
     assert len(learned_facts(store)) == 1
 

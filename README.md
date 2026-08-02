@@ -155,6 +155,9 @@ Key public symbols (see `figtree/__init__.py`):
 | `KVCacheManager` | External quantized K/V blobs (lazy/eager, local or `s3://`). |
 | `load_model(model_id, device, dtype)` | Convenience loader; defaults to `unsloth/Qwen3-4B-bnb-4bit`. |
 | `extract_atoms` / `missing_atoms` / `recall_score` | Atom-level recall measurement. |
+| `teach` / `extract_roles` / `forget` / `learned_facts` | One-shot prompt learning: LLM role extraction + role/identity figments with association edges (conflict policy: newest-high-trust wins; deterministic `role:{role}:{value}` ids). |
+| `retrieve_by_roles` / `role_lookup` | Role-intersection retrieval; rule-based query extraction by default (exact 1.0 / token-subset 0.95 / jaccard ≥0.6 0.85). |
+| `propose_identity_merges` / `assert_identity` / `merge_role_figments` / `expand_identities` / `identity_groups` | Identity merge engine: surface-form variants → canonical role figment with rewritten references. |
 
 A longer, domain-neutral walkthrough lives in
 [`examples/library_usage.py`](examples/library_usage.py).

@@ -10,8 +10,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from figtree.figment import Figment
-from figtree.ingest import ingest_text_to_figments, split_into_paragraphs, split_into_sentences
-from figtree.lancedb_store import connect
+from figtree.ingest import split_into_paragraphs, split_into_sentences
 from figtree.summarize import summarize_image
 
 

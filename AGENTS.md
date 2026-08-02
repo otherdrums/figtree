@@ -99,6 +99,10 @@ figtree/
 ├── graph.py            # Edges/trust as figments + source-based credibility
 ├── lancedb_store.py    # LanceDB store (compression + object storage)
 ├── kv_cache_manager.py # K/V materialization: lazy/eager, quantized, tiered
+├── learn.py            # Prompt learning: teach/forget/apply_roles_to_store
+├── retrieve.py         # Role-intersection retrieval (role_lookup/retrieve_by_roles)
+├── identity.py         # Merge engine: surface-form variants → canonical role figments
+├── recall.py           # Faithful recall: atom extraction + generate_faithful
 ├── summarize.py        # Hierarchical figments: summarized image boundaries
 ├── cli.py              # Typer CLI: ingest/generate/graph/benchmark/compare
 └── kernel/
@@ -303,6 +307,103 @@ forward pass by replaying cached K/V, at the cost of ~2.8 MB/figment disk
 storage. On the 3GB test GPU the wall-clock is comparable to text-based
 generation (KV-load + RoPE roughly cancels the saved forward pass); the benefit
 is the storage/compute trade-off, not a fixed speedup.
+
+## How to Use Figtree
+
+Figtree is a library first: connect to a store, ingest or teach figments,
+retrieve by role intersection, and generate from boundaries or text. The
+examples in `examples/` walk the full cycle on real hardware:
+
+```bash
+python3 examples/library_usage.py      # minimal, domain-neutral walkthrough
+python3 examples/davos_learn_demo.py   # teach one-shot memories + role retrieval
+python3 examples/run_davos_v2.py all   # full Davos pipeline (ingest + generate + graph)
+python3 examples/davos_shell_v2.py     # interactive REPL over a store
+```
+
+### 1. Connect and ingest
+
+```python
+from figtree import connect, ingest_text_to_figments, load_model
+
+model, tokenizer = load_model()                  # Qwen3-4B bnb-4bit, cached
+store = connect("./figtree.lance")
+
+figments = ingest_text_to_figments(
+    model, tokenizer, text,
+    store=store, source_id="reuters", trust=0.95,
+    # decode_prompt=..., decode_max_tokens=256, decode_temperature=0.0  # single-pass decode
+)
+# Returns: [image, atomic_1, atomic_2, ..., trust_assertion]
+```
+
+### 2. Teach one-shot memories (prompt learning)
+
+```python
+from figtree.learn import teach, extract_roles, forget, learned_facts
+from figtree.retrieve import retrieve_by_roles, role_lookup
+
+figment = teach("My daughter's name is June and she is allergic to cashews.",
+                store=store, model=model, tokenizer=tokenizer)
+# → identity + role figments (role:{role}:{value}) with association edges;
+#   supersedes older values of the same role+actor
+
+hits = retrieve_by_roles("What is the user's daughter allergic to?", store)
+# → [Figment(..., meta["role_match"]="CONSTRAINT")]
+
+learned_facts(store)   # all active learned statements
+forget("My daughter's name is June...", store=store)  # supersede by "forgotten"
+```
+
+### 3. Identity: merge surface-form variants
+
+```python
+from figtree import (propose_identity_merges, assert_identity,
+                     merge_role_figments, expand_identities, identity_groups)
+
+proposals = propose_identity_merges(store)        # same-role variants, scored
+edge = assert_identity(store, a_id, b_id)          # edge_type="association"
+n = merge_role_figments(store, keep_id, [variant_ids])  # canonical-node rewrite
+expand_identities(store, role_figment_id)          # reachable alias set
+identity_groups(store)                             # {cluster_root: [variants]}
+```
+
+`merge_role_figments` promotes one row to the canonical node
+(`is_association=True`) and rewrites every reference to the removed variants
+(article/paragraph `role_figments`, `sentence.children`, relationship edges,
+association edges, dedup_obs), then deletes the variant rows. figtree-news
+thin-wraps this engine (`figtree_news/associations.py`).
+
+### 4. Retrieve by role intersection
+
+```python
+from figtree.retrieve import role_lookup, retrieve_by_roles
+
+role_lookup(store, "NAME", "June")        # exact 1.0 / subset 0.95 / jaccard 0.85
+retrieve_by_roles("What is June allergic to?", store,
+                  require_all=True)       # role-intersection over statements
+```
+
+Role matching is role-scoped, not domain-scoped: any `kind="role"` figment
+with the matching `meta["role"]` is found — learned facts (`learning=True`,
+`references` → statements) and news figments (figtree-news, `article_id` →
+articles) alike.
+
+### 5. Generate
+
+```python
+from figtree.generate import FigmentGenerator
+
+gen = FigmentGenerator(model, tokenizer)
+result = gen.generate(figments, prompt="What happened at Davos?", max_new_tokens=100)
+# text-based: forward pass per figment, then prompt prefill + decode
+
+result = gen.generate_faithful(figments, prompt, max_new_tokens=200)
+# greedy, source-sized budget — recall guaranteed by construction
+
+result = gen.generate_from_boundaries(figments, prompt, kv_manager=kv_manager)
+# boundary path: replay cached K/V — no forward pass for figment tokens
+```
 
 ## Key Commands
 

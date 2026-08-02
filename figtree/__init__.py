@@ -9,6 +9,8 @@ Public API (importable for use in higher-level projects):
         connect, KVCacheManager, recall_score, missing_atoms, extract_atoms,
         summarize_image, teach, extract_roles, apply_roles_to_store, forget,
         role_lookup, retrieve_by_roles, learned_facts,
+        propose_identity_merges, assert_identity, expand_identities,
+        merge_role_figments, identity_groups,
     )
 """
 
@@ -32,6 +34,13 @@ from figtree.learn import (
     teach,
 )
 from figtree.retrieve import role_lookup, retrieve_by_roles
+from figtree.identity import (
+    assert_identity,
+    expand_identities,
+    identity_groups,
+    merge_role_figments,
+    propose_identity_merges,
+)
 
 try:  # version is single-sourced from package metadata
     from importlib.metadata import version as _version, PackageNotFoundError
@@ -39,9 +48,9 @@ try:  # version is single-sourced from package metadata
     try:
         __version__ = _version("figtree")
     except PackageNotFoundError:  # running from a source checkout without install
-        __version__ = "0.3.0"
+        __version__ = "0.4.0"
 except Exception:  # pragma: no cover
-    __version__ = "0.3.0"
+    __version__ = "0.4.0"
 
 __all__ = [
     "Figment",
@@ -64,5 +73,10 @@ __all__ = [
     "role_lookup",
     "retrieve_by_roles",
     "learned_facts",
+    "propose_identity_merges",
+    "assert_identity",
+    "expand_identities",
+    "merge_role_figments",
+    "identity_groups",
     "__version__",
 ]

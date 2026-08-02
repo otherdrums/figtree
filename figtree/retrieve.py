@@ -5,8 +5,11 @@ Queries surface learned facts by extracting the roles the question asks about
 association figments created by :mod:`figtree.learn`. Statement figments whose
 text carries the fact are returned, ready to feed ``FigmentGenerator``.
 
-Only figments stamped ``meta["learning"]=True`` are considered, so news-domain
-role figments (figtree-news) in the same store are never returned.
+Role figments are scoped by ``meta["role"]`` only — not by domain. A store may
+hold both learned figments (``learning=True``) and news figments
+(``article_id``-referenced, as in figtree-news); ``role_lookup`` matches any
+role figment, and statement resolution follows ``references`` (learned) or
+``article_id`` (news) accordingly.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ def role_lookup(
     matches: list[tuple[Figment, float]] = []
     want = _normalize(value) if value else None
     for f in store.all():
-        if f.kind != "role" or f.meta.get("learning") is not True:
+        if f.kind != "role":
             continue
         if f.meta.get("role") != role:
             continue
@@ -131,7 +134,11 @@ def retrieve_by_roles(
     by_statement: dict[str, dict[str, Any]] = {}
     for role, figs in role_figs.items():
         for f in figs:
+            # Learned figments reference statements via "references"; news
+            # figments (figtree-news) reference their article via "article_id".
             refs = [r for r in (f.meta.get("references") or []) if store.get(r) is not None]
+            if not refs and f.meta.get("article_id"):
+                refs = [f.meta["article_id"]]
             for sid in refs:
                 entry = by_statement.setdefault(
                     sid, {"statement_id": sid, "roles": set(), "trust": 0.0}
