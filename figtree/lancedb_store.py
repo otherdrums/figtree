@@ -94,6 +94,15 @@ def _schema_for(hidden_size: int) -> type[LanceModel]:
     return FigmentRecord
 
 
+def _open_db(uri: str | Path, storage_options: dict[str, str] | None = None) -> DBConnection:
+    """Open a LanceDB connection at ``uri`` (local path or object-store URI)."""
+    opts = dict(STORAGE_OPTIONS)
+    if storage_options:
+        opts.update(storage_options)
+    db: DBConnection = lancedb.connect(str(uri), storage_options=opts)
+    return db
+
+
 def connect(
     uri: str | Path = DEFAULT_LOCAL_URI,
     storage_options: dict[str, str] | None = None,
@@ -105,17 +114,29 @@ def connect(
     """
     if lancedb is None:
         raise ImportError("lancedb is required for LanceDB storage; install with `pip install lancedb`")
-    opts = dict(STORAGE_OPTIONS)
-    if storage_options:
-        opts.update(storage_options)
-    db: DBConnection = lancedb.connect(str(uri), storage_options=opts)
-    return FigmentStore(db, table_name=table_name)
+    return FigmentStore(_open_db(uri, storage_options), table_name=table_name)
 
 
 class FigmentStore:
-    """Thin wrapper over a LanceDB table holding Figment records."""
+    """Thin wrapper over a LanceDB table holding Figment records.
 
-    def __init__(self, db: DBConnection, table_name: str = DEFAULT_TABLE):
+    ``db`` may be a ``DBConnection`` or a path string/``Path`` (in which case
+    the connection is opened the same way :func:`connect` does, so legacy call
+    sites like ``FigmentStore("./news.lance")`` keep working).
+    """
+
+    def __init__(
+        self,
+        db: DBConnection | str | Path,
+        table_name: str = DEFAULT_TABLE,
+        storage_options: dict[str, str] | None = None,
+    ):
+        if isinstance(db, (str, Path)):
+            if lancedb is None:
+                raise ImportError(
+                    "lancedb is required for LanceDB storage; install with `pip install lancedb`"
+                )
+            db = _open_db(db, storage_options)
         self.db = db
         self.table_name = table_name
         self._table = None

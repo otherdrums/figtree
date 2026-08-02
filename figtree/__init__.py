@@ -7,7 +7,8 @@ Public API (importable for use in higher-level projects):
     from figtree import (
         Figment, FigmentGenerator, Figtree, ingest_text_to_figments,
         connect, KVCacheManager, recall_score, missing_atoms, extract_atoms,
-        summarize_image,
+        summarize_image, teach, extract_roles, apply_roles_to_store, forget,
+        role_lookup, retrieve_by_roles, learned_facts,
     )
 """
 
@@ -22,6 +23,15 @@ from figtree.kv_cache_manager import KVCacheManager
 from figtree.model import load_model
 from figtree.recall import extract_atoms, missing_atoms, recall_score
 from figtree.summarize import summarize_image
+from figtree.learn import (
+    apply_roles_to_store,
+    extract_query_roles,
+    extract_roles,
+    forget,
+    learned_facts,
+    teach,
+)
+from figtree.retrieve import role_lookup, retrieve_by_roles
 
 try:  # version is single-sourced from package metadata
     from importlib.metadata import version as _version, PackageNotFoundError
@@ -29,9 +39,9 @@ try:  # version is single-sourced from package metadata
     try:
         __version__ = _version("figtree")
     except PackageNotFoundError:  # running from a source checkout without install
-        __version__ = "0.2.1"
+        __version__ = "0.3.0"
 except Exception:  # pragma: no cover
-    __version__ = "0.2.1"
+    __version__ = "0.3.0"
 
 __all__ = [
     "Figment",
@@ -46,5 +56,13 @@ __all__ = [
     "missing_atoms",
     "recall_score",
     "summarize_image",
+    "teach",
+    "extract_roles",
+    "extract_query_roles",
+    "apply_roles_to_store",
+    "forget",
+    "role_lookup",
+    "retrieve_by_roles",
+    "learned_facts",
     "__version__",
 ]

@@ -22,6 +22,7 @@ from figtree.figment import Figment
 from figtree.generate import FigmentGenerator
 from figtree.graph import Figtree
 from figtree.lancedb_store import connect
+from figtree.learn import forget, learned_facts, teach
 
 console = Console()
 MODEL_ID = "unsloth/Qwen3-4B-bnb-4bit"
@@ -101,7 +102,35 @@ def main():
         if query == "/quit":
             break
         elif query == "/help":
-            console.print("Commands: /trust, /sources, /figments <key>, /all, /quit")
+            console.print("Commands: /teach <statement>, /forget <value>, /learned, "
+                          "/trust, /sources, /figments <key>, /all, /quit")
+            continue
+        elif query.startswith("/teach "):
+            statement = query[len("/teach "):].strip()
+            if not statement:
+                continue
+            console.print("[dim]Teaching...[/dim]")
+            result = teach(model, tokenizer, statement, store, session_id="user", trust=0.95)
+            console.print(f"[green]Learned:[/green] {result['roles']}")
+            if result["superseded"]:
+                console.print(f"[yellow]Superseded:[/yellow] {result['superseded']}")
+            continue
+        elif query.startswith("/forget "):
+            value = query[len("/forget "):].strip()
+            for role in ("NAME", "PREFERENCE", "POLICY", "CONSTRAINT", "FACT", "RELATIONSHIP"):
+                if forget(store, role, value):
+                    console.print(f"[green]Forgot {role}: {value}[/green]")
+                    break
+            else:
+                console.print("[yellow]No active learned fact matched.[/yellow]")
+            continue
+        elif query == "/learned":
+            facts = learned_facts(store)
+            if not facts:
+                console.print("[yellow]Nothing learned yet. Use /teach <statement>.[/yellow]")
+                continue
+            for f in facts:
+                console.print(f"  {f.meta.get('role', '?'):12s} {f.text}")
             continue
         elif query == "/trust":
             analysis = graph.analyze_sources()

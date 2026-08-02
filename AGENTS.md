@@ -16,6 +16,51 @@ K/V caches (`kv_cache`, ~2.8 MB per 20-token figment before quantization) live *
 row as external quantized blobs addressed by `kv_uri`, managed by `KVCacheManager` (lazy by
 default; eager via `compute_kv=True`). The legacy `.figment/` directory format has been removed.
 
+## Prompt Learning (One-Shot Memory)
+
+```python
+from figtree.learn import teach, extract_roles, extract_query_roles, forget
+from figtree.retrieve import retrieve_by_roles, role_lookup
+from figtree import connect
+
+store = connect("./figtree.lance")
+# One-shot teach: model extracts roles, store persists identity+role nodes
+# with association edges and supersedes old values of the same role+actor.
+figment = teach("My daughter's name is June and she is allergic to cashews.",
+                store=store, model=model, tokenizer=tokenizer)
+
+# Rule-based (CPU, default) role extraction for queries — no model needed.
+hits = retrieve_by_roles("What is the user's daughter allergic to?", store)
+# → [Figment("My daughter's name is June and she is allergic to cashews.",
+#            meta["role_match"]="CONSTRAINT")]
+```
+
+- `figtree/learn.py`: `teach()` (LLM role extraction + `apply_roles_to_store`),
+  `extract_roles()` (LLM statement extraction, zero-shot), `extract_query_roles()`
+  (rule-based query extraction; LLM variant optional), `forget()`,
+  `learned_facts()`.
+- `figtree/retrieve.py`: `retrieve_by_roles()` = role-intersection retrieval.
+  The default query extractor is rule-based (`extract_query_roles`), and role
+  lookup scoring is exact 1.0 / query-token-subset 0.95 / jaccard ≥0.6 0.85.
+  ACTOR and CORRECTION roles restrict the result set (actor filtering via
+  association links) rather than matching statements.
+- Learned figments carry `meta["learning"]=True` + `provenance`
+  (type/session/statement/timestamp) and **no `source_id`**, so the
+  source-based trust model is untouched. IDs are deterministic:
+  `role:{role}:{value}` / `assoc:{role}:{actor}:{value}` (SHA-256 truncated to
+  16 hex, byte-identical to the figtree-news app's scheme).
+- Conflict policy: newest-high-trust wins. Old nodes are kept with
+  `superseded_by`/`superseded_at`; `forget()` marks nodes
+  `superseded_by="forgotten"`.
+- The Qwen3-4B (bnb-4bit) model reliably extracts roles from declarative
+  statements (zero-shot) but fails abstract/imperative query extraction, so
+  query extraction defaults to rules. `_llm_decode` guards against repetition
+  and frees the KV cache (`gc.collect()` + `torch.cuda.empty_cache()`) to stay
+  inside the 4GB VRAM budget.
+- Backward compatibility: `generate_faithful(..., source_tokens=)` accepts the
+  figtree-news argument name, and `FigmentStore(...)`/`connect(...)` accept a
+  path string or `Path` (via `_open_db`).
+
 ## Build / Test / Lint
 
 ```bash
@@ -24,6 +69,15 @@ ruff check figtree/
 
 # Quick pipeline test
 python3 tests/test_v2_pipeline.py
+
+# Learning tests (CPU, mocked)
+python3 -m pytest tests/test_learn.py
+
+# Learning e2e (GPU; model + tokenizer required)
+python3 tests/test_teach_e2e.py
+
+# Learning demo
+python3 examples/davos_learn_demo.py
 
 # Full Davos demo
 python3 examples/run_davos_v2.py all

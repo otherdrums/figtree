@@ -189,6 +189,7 @@ class FigmentGenerator:
         figments: list[Figment],
         prompt: str,
         source_texts: list[str] | None = None,
+        source_tokens: int | None = None,
         max_new_tokens: int = 400,
         temperature: float = 0.7,
         top_k: int = 50,
@@ -203,11 +204,16 @@ class FigmentGenerator:
         ``missing_atoms`` are attached to the result for measurement — but no
         verify-and-patch follow-up is performed (the loop was removed once the
         faithful path proved flawless on its own).
+
+        ``source_tokens`` is an alias for callers that already know the source
+        length in tokens (figtree-news): the budget is derived from it directly
+        and recall reporting is skipped.
         """
         from figtree.recall import missing_atoms, recall_score
 
-        source_tokens = None
-        if source_texts:
+        if source_texts is None and source_tokens is None:
+            source_tokens = None
+        elif source_texts is not None and source_tokens is None:
             source_tokens = sum(
                 len(self.tokenizer.encode(t, add_special_tokens=False))
                 for t in source_texts
